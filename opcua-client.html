@@ -1,0 +1,344 @@
+<script type="text/javascript">
+    RED.nodes.registerType("opcua client endpoint", {
+        category: "config",
+        defaults: {
+            endpoint: {value: "", required: true},
+            // NOTE: this is not supported yet
+            // securityMode: {value: "None", required: true},
+            securityPolicy: {value: "None", required: true},
+            userIdentity: {value: "Anonymous", required: true},
+            name: {value: "", required: false}
+        },
+        credentials: {
+            user: {type:"text"},
+            password: {type: "password"}
+        },
+        label: function() {
+            return this.name || this.endpoint;
+        },
+        oneditprepare: () => {
+            const inputSecurityMode = $('#node-config-input-securityMode');
+            const inputUserIdentity = $('#node-config-input-userIdentity');
+
+            if (inputSecurityMode.val() === "None") {
+                $('#form-securityPolicy').hide();
+            }
+            else {
+                $('#form-securityPolicy').show();
+            }
+            inputSecurityMode.on('change', () => {
+                if (inputSecurityMode.val() === "None") {
+                    $('#form-securityPolicy').hide();
+                }
+                else {
+                    $('#form-securityPolicy').show();
+                }
+            });
+
+            if (inputUserIdentity.val() === "Anonymous") {
+                $('#form-credentials').hide();
+            }
+            else {
+                $('#form-credentials').show();
+            }
+            inputUserIdentity.on('change', () => {
+                if (inputUserIdentity.val() === "Anonymous") {
+                    $('#form-credentials').hide();
+                }
+                else {
+                    $('#form-credentials').show();
+                }
+            });
+        }
+    });
+</script>
+
+<script type="text/html" data-template-name="opcua client endpoint">
+    <div class="form-row">
+        <label for="node-config-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-config-input-name" placeholder="">
+    </div>
+    <div class="form-row">
+        <label for="node-config-input-endpoint"><i class="fa fa-globe"></i> Endpoint</label>
+        <input type="text" id="node-config-input-endpoint" placeholder="">
+    </div>
+    <!--
+    NOTE: this is not supported yet
+    <div class="form-row">
+        <label for="node-config-input-securityMode"><i class="icon-key"></i> Security Mode</label>
+        <select type="text" id="node-config-input-securityMode">
+            <option value="None" selected>None</option>
+            <option value="Sign">Sign</option>
+            <option value="SignAndEncrypt">Sign&Encrypt</option>
+        </select>
+    </div>
+    <div class="form-row" id="form-securityPolicy">
+        <label for="node-config-input-securityPolicy"><i class="icon-key"></i> Security Policy</label>
+        <select type="text" id="node-config-input-securityPolicy">
+            <option value="None">None</option>
+            <option value="Basic128">Basic128</option>
+            <option value="Basic128Rsa15">Basic128Rsa15</option>
+            <option value="Basic192">Basic192</option>
+            <option value="Basic192Rsa15">Basic192Rsa15</option>
+            <option value="Basic256">Basic256</option>
+            <option value="Basic256Rsa15">Basic256Rsa15</option>
+            <option value="Basic256Sha256">Basic256Sha256</option>
+            <option value="Aes128_Sha256">Aes128_Sha256</option>
+            <option value="Aes128_Sha256_RsaOaep">Aes128_Sha256_RsaOaep</option>
+            <option value="PubSub_Aes128_CTR">PubSub_Aes128_CTR</option>
+            <option value="PubSub_Aes256_CTR">PubSub_Aes256_CTR</option>
+        </select>
+    </div>
+    -->
+    <div class="form-row">
+        <label for="node-config-input-userIdentity"><i class="fa fa-user-secret"></i> User Identity</label>
+        <select type="text" id="node-config-input-userIdentity">
+            <option value="Anonymous">Anonymous</option>
+            <option value="UserName">Username & Password</option>
+        </select>
+    </div>
+    <div class="form-row" id="form-credentials">
+        <label for="node-config-input-user"><i class="fa fa-user"></i> Username</label>
+        <input type="text" id="node-config-input-user">
+        <br>
+        <label for="node-config-input-password"><i class="fa fa-lock"></i> Password</label>
+        <input type="password" id="node-config-input-password">
+    </div>
+</script>
+
+<script type="text/markdown" data-help-name="opcua client endpoint">
+The **opcua client endpont** configures and manage the connection with the OPC UA server. 
+### Details
+It handles the underlying client connection, security settings, and authentication methods.
+The connection is shared across all **opcua client** nodes that use this endpoint.
+
+- **Endpoint** specifies the OPC UA server’s address.
+- **User Identity** Defines the authentication method. Two options are available: "Anonymous" and "Username & Password."
+
+</script>
+
+//////////////////////////////////
+
+<script type="text/javascript">
+    
+    const isZeroOrPositiveNumber = (value) => {
+        const num = Number(value);
+        return !isNaN(num) && num >= 0;
+    };
+
+    const isPositiveNumber = (value) => {
+        const num = Number(value);
+        return !isNaN(num) && num > 0;
+    };
+
+    RED.nodes.registerType("opcua client", {
+        category: "network",
+        color: "#AFE1AF",
+        defaults: {
+            endpoint: {value: "", type: "opcua client endpoint", required: true},
+            mode: {value: "read"},
+            // BROWSE
+            depth: {value: 1, required: true, validate: isPositiveNumber},
+            // SUBSCRIBE
+            publishingInterval: {value: 1000, required: true, validate: isZeroOrPositiveNumber},
+            samplingInterval: {value: 100, required: true, validate: isZeroOrPositiveNumber},
+            queueSize: {value: 10, required: true, validate: isPositiveNumber},
+
+            name: {value: ""},
+        },
+        inputs: 1,
+        outputs: 1,
+        icon: "bridge-dash.svg",
+        label: function() {
+            if (this.name) return this.name;
+            const endpointNode = RED.nodes.node(this.endpoint);
+            if (endpointNode) return endpointNode.label();
+            return "opcua client";
+        },
+        oneditprepare: function() {
+            const inputMode = $('#node-input-mode');
+
+            if (inputMode.val() === "browse") {
+                $('#form-browse').show();
+                $('#form-subscribe').hide();
+            }
+            else if (inputMode.val() === "subscribe" || inputMode.val() === "alarm") {
+                $('#form-browse').hide();
+                $('#form-subscribe').show();
+            }
+            else {
+                $('#form-browse').hide();
+                $('#form-subscribe').hide();
+            }
+            
+            inputMode.on('change', () => {
+                if (inputMode.val() === "browse") {
+                    $('#form-browse').show();
+                    $('#form-subscribe').hide();
+                }
+                else if (inputMode.val() === "subscribe" || inputMode.val() === "alarm") {
+                    $('#form-browse').hide();
+                    $('#form-subscribe').show();
+                }
+                else {
+                    $('#form-browse').hide();
+                    $('#form-subscribe').hide();
+                }
+            });
+        }
+    });
+</script>
+
+
+<style>
+    #form-subscribe .form-row label {
+        width: 30%;
+        white-space: nowrap;
+        text-align: left;
+        margin-right: 5px;
+    }
+
+    #form-subscribe .form-row input {
+        width: 20%;
+        padding: 5px;
+    }
+</style>
+
+<script type="text/html" data-template-name="opcua client">
+    <div class="form-row">
+        <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-input-name" placeholder="Name">
+    </div>
+    <div class="form-row">
+		<label for="node-input-endpoint"><i class="fa fa-bolt"></i> Endpoint</label>
+		<input type="text" id="node-input-endpoint">
+	</div>
+    <div class="form-row">
+		<label for="node-input-mode"><i class="fa fa-sliders"></i> Mode</label>
+		<select type="text" id="node-input-mode">
+            <option value="browse" selected>Browse</option>
+			<option value="read">Read</option>
+			<option value="subscribe">Subscribe</option>
+			<option value="write">Write</option>
+            <option value="alarm">Alarm & Events</option>
+		</select>
+	</div>
+    <hr>
+    <div class="form-row" id="form-browse" style="height: 34px;">
+        <label for="node-input-depth"><i class="fa fa-level-down"></i> Max depth</label>
+        <input type="text" id="node-input-depth" placeholder="1">
+    </div>
+    <div id="form-subscribe">
+        <div class="form-row">
+            <label for="node-input-publishingInterval"><i class="fa fa-clock-o"></i> Publishing interval</label>
+            <input type="text" id="node-input-publishingInterval" placeholder="1000">
+        </div>
+        <div class="form-row" id="form-subscribe">
+            <label for="node-input-samplingInterval"><i class="fa fa-clock-o"></i> Sampling interval</label>
+            <input type="text" id="node-input-samplingInterval" placeholder="100">
+        </div>
+        <div class="form-row" id="form-subscribe">
+            <label for="node-input-queueSize"><i class="fa fa-bars"></i> Queue size</label>
+            <input type="text" id="node-input-queueSize" placeholder="10">
+        </div>
+    </div>
+</script>
+
+<script type="text/markdown" data-help-name="opcua client">
+The **opcua client** node allows you to interact with OPC UA servers to browse, read, subscribe to variable changes, write, and monitor events (alarms).
+
+### Browse
+Explore the server's address space.
+#### Inputs
+: payload (string) :  A string representing the node ID to start browsing from.
+Example:
+```javascript
+msg.payload = "RootFolder";
+```
+#### Outputs
+: payload (Array) : An array of browsed nodes, each containing `nodeId`, `browseName`, `nodeClass`, `value`, `dataType`, and `children` (if any).
+
+#### Details
+**Max depth** specifies the depth level for browsing the address space. Setting a value greater than 1 enables recursive browsing. Depending on the depth and server capabilities, this operation may take time.
+
+
+### Read
+Read variable values from the server.
+#### Inputs
+: payload (object) : An object with variable names as keys and OPC UA node IDs as values.
+Example:
+```javascript
+msg.payload = {
+    temperature: "ns=1;s=Temperature",
+    pressure: "ns=1;s=Pressure"
+};
+
+```
+#### Outputs
+: payload (object) : An object with variable names as keys and read results as values. Each result includes `value`, `dataType`, `arrayType`, and `statusCode`.
+
+### Subscribe
+Subscribe to variable changes.
+#### Inputs
+: payload (object) : An object with variable names as keys and OPC UA node IDs as values.
+: reset ( ) : If a message is received with this property, any subscription will be cleared.
+Example:
+```javascript
+msg.payload = {
+    temperature: "ns=1;s=Temperature",
+    pressure: "ns=1;s=Pressure"
+};
+```
+#### Outputs
+: payload (object) : An object with variable names as keys and read results as values, including `value`, `dataType`, `arrayType`, and `statusCode`.
+**Note**: Each variable is returned in a separate `msg.payload`, even if updates occur simultaneously.
+
+#### Details
+- **Publishing interval** defines the cyclic rate at which the subscription executes.
+- **Sampling interval** indicates the fastest rate at which the OPC UA server should sample its underlying source of data changes.
+- **Queue size** specifies the size of the buffer for storing received events. 
+
+**Note**: The server may adjust these values based on its performance capabilities and resource constraints.
+
+### Write
+Write values to server variables.
+#### Inputs
+: payload (object) :  An object with variable names as keys and objects containing `nodeId`, `value`, and `dataType`.
+Example:
+```javascript
+msg.payload = {
+    setpoint: {
+        nodeId: "ns=1;s=Setpoint",
+        value: 42.5,
+        dataType: "Float"
+    }
+};
+```
+
+
+### Events
+Monitor server events (and alarms).
+#### Inputs
+: payload (object) : An object with variable names as keys and OPC UA node IDs as values.
+: reset ( ) : If a message is received with this property, any event subscription will be cleared.
+Example:
+```javascript
+msg.payload = {
+    alarm: "ns=3;i=1805",
+};
+```
+#### Outputs
+: payload (object) : An object with variable names as keys and alarm attribues as values. The attributes depend on the subscribed events.
+
+#### Details
+- **Publishing interval** defines the cyclic rate at which the subscription executes.
+- **Sampling interval** indicates the fastest rate at which the OPC UA server should sample its underlying source of data changes.
+- **Queue size** specifies the size of the buffer for storing received events. 
+
+**Note**: The server may adjust these values based on its performance capabilities and resource constraints.
+
+### References
+- [OPC UA Documentation](https://reference.opcfoundation.org/)
+- [node-opcua](https://node-opcua.github.io/)
+
+</script>
