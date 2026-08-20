@@ -315,6 +315,17 @@ msg.payload = {
 };
 ```
 
+One-dimensional arrays use the same payload structure. The array type is inferred from `value`:
+```javascript
+msg.payload = {
+    setpoints: {
+        nodeId: "ns=1;s=Setpoints",
+        value: [42.5, 53.5, 12.1],
+        dataType: "Float"
+    }
+};
+```
+
 
 ### Events
 Monitor server events (and alarms).

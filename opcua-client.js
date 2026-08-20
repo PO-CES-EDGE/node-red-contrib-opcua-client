@@ -466,27 +466,46 @@ const isTypeValid = {
     "DateTime": opcua.isValidDateTime,
 }
 
-// NOTE: we only support writing 'Scalar' for now
 function buildWriteValue(dataType, value) {
-    if (isTypeValid[dataType]) {
-        if (isTypeValid[dataType](value)) {
-            return {
-                dataType: opcua.DataType[dataType],
-                arrayType: opcua.VariantArrayType.Scalar,
-                value: value
-            }
-        } else {
-            throw new Error(`'${value}' is not a valid value for type '${dataType}'`);
-        }
-    } else {
+    const validator = isTypeValid[dataType];
+    if (!validator) {
         throw new Error(`Unsupported dataType '${dataType}'. Supported types are: ${Object.keys(isTypeValid).map(key => `'${key}'`).join(", ")}`);
+    }
+
+    // node-opcua represents scalar Int64 and UInt64 values as [high, low].
+    // Prefer the scalar interpretation when the complete value validates as one.
+    const is64BitScalar = (dataType === "Int64" || dataType === "UInt64") &&
+        Array.isArray(value) &&
+        !value.some(Array.isArray) &&
+        validator(value);
+    const isArray = Array.isArray(value) && !is64BitScalar;
+
+    if (isArray) {
+        for (const [index, item] of value.entries()) {
+            if (!validator(item)) {
+                throw new Error(`'${item}' at index ${index} is not a valid value for type '${dataType}'`);
+            }
+        }
+    } else if (!validator(value)) {
+        throw new Error(`'${value}' is not a valid value for type '${dataType}'`);
+    }
+
+    return {
+        dataType: opcua.DataType[dataType],
+        arrayType: isArray ? opcua.VariantArrayType.Array : opcua.VariantArrayType.Scalar,
+        value: value
     }
 }
 
 async function handleWrite(node, msg) {
     
-    if (!msg.payload || typeof msg.payload !== 'object') {
+    if (!msg.payload || typeof msg.payload !== 'object' || Array.isArray(msg.payload)) {
         node.error(`Invalid input ${JSON.stringify(msg.payload)}: payload should be an object with variable names as keys and OPC UA tags as values.`, msg);
+        return;
+    }
+
+    if (Object.keys(msg.payload).length === 0) {
+        node.error("Invalid input: payload must contain at least one item to write.", msg);
         return;
     }
 
@@ -495,14 +514,16 @@ async function handleWrite(node, msg) {
     const errorDetails = [];
 
     for (const [key, value] of Object.entries(msg.payload)) {
-        if (!value || 
+        if (!value ||
+            typeof value !== 'object' ||
+            Array.isArray(value) ||
             !value.nodeId || 
             value.value === undefined || 
             value.dataType === undefined
         ) {
             errorDetails.push({
                 variableName: key,
-                nodeId: value.nodeId,
+                nodeId: value && typeof value === 'object' ? value.nodeId : undefined,
                 errorDescription: "Invalid payload structure. Please provide a 'nodeId', 'value', and 'dataType'."
             })
             continue;
@@ -523,6 +544,11 @@ async function handleWrite(node, msg) {
                 errorDescription: error.message
             })
         }
+    }
+
+    if (nodesToWrite.length === 0) {
+        node.error(`Failed to write the following item/s:\n${errorDetails.map((variable) => `- ${variable.variableName} [${variable.nodeId}]: ${variable.errorDescription}`).join('\n')}`, {errorDetails});
+        return;
     }
     
     try {
