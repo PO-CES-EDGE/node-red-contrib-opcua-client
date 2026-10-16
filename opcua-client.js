@@ -120,11 +120,21 @@ async function initializeSession(node) {
     // If the server does not handle concurrency very well, we do not want to send the createSession concurrently
     // TODO: find a better way to solve this.
     await delay(Math.random() * 1000);
+    if (node.closing) return;
     const client = node.endpoint.client;
     if (!client || node.endpoint.state !== CONNECTED) {
         throw new Error("client is not connected to the OPC UA server");
     }
     const session = await client.createSession(node.endpoint.userIdentity);
+    // Close may finish while CreateSession is still in flight.
+    if (node.closing || client !== node.endpoint.client || node.endpoint.state !== CONNECTED) {
+        try {
+            await withTimeout(session.close(), CLOSE_TIMEOUT, "Late session close");
+        } catch (error) {
+            node.debug("Error closing obsolete session (ignored): " + error);
+        }
+        return;
+    }
     node.debug("Session created");
 
     // NOTE: events from a session that has already been replaced are ignored
@@ -394,6 +404,7 @@ module.exports = function(RED) {
 
         node.session = null;
         node.subscription = null;
+        node.closing = false;
 
         // NOTE: session and subscription changes run one at a time, otherwise a reconnection
         // can interleave with an error cleanup and leave the node without a valid session
@@ -407,12 +418,14 @@ module.exports = function(RED) {
         // If this is called after a reconnection, we cannot guarantee that sessions and subscriptions are still valid.
         // Just in case, we recreate everything
         const setupSession = async () => {
+            if (node.closing) return;
             if (node.subscription) await closeSubscription(node);
             if (node.session) await closeSession(node);
             if (node.endpoint.state !== CONNECTED) return;
 
             try {
                 await initializeSession(node);
+                if (node.closing || !node.session) return;
 
                 if (node.mode === "subscribe") {
                     if (!isObjectEmpty(node.monitoredItems)) {
@@ -433,6 +446,7 @@ module.exports = function(RED) {
                 }
             }
             catch (error) {
+                if (node.closing) return;
                 node.error(`Error initializing OPC UA session: ${error}`);
                 node.status({ fill: "red", shape: "dot", text: "error" });
             }
@@ -440,7 +454,7 @@ module.exports = function(RED) {
 
         // Recreate the session if 'session' is still the current one
         node.recoverSession = (session, reason) => {
-            if (!session || session !== node.session) return;
+            if (node.closing || !session || session !== node.session) return;
             if (node.endpoint.state !== CONNECTED) return; // the endpoint will emit CONNECTED when it is back
             node.warn(`Recreating OPC UA session: ${reason}`);
             serialize(async () => {
@@ -486,6 +500,7 @@ module.exports = function(RED) {
         }
 
         node.on("input", async (msg) => {
+            if (node.closing) return;
             // Manual recovery from a flow: recreate the OPC UA client, like a flow restart
             if (msg.reconnect) {
                 node.endpoint.recover("requested by msg.reconnect");
@@ -526,6 +541,7 @@ module.exports = function(RED) {
             }
         });
         node.on("close", async (done) => {
+            node.closing = true;
             // NOTE: the endpoint may outlive this node (partial deploy), so the listeners must be removed
             node.endpoint.removeListener("CONNECTING", onConnecting);
             node.endpoint.removeListener("CONNECTED", onConnected);
