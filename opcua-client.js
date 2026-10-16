@@ -168,7 +168,17 @@ async function closeSession(node) {
 }
 
 async function initializeSubscription(node) {
-    const subscription = await node.session.createSubscription2(node.subscriptionOptions);
+    const session = node.session;
+    const revision = node.monitoringRevision;
+    const subscription = await session.createSubscription2(node.subscriptionOptions);
+    if (node.closing || session !== node.session || revision !== node.monitoringRevision) {
+        try {
+            await withTimeout(subscription.terminate(), CLOSE_TIMEOUT, "Late subscription close");
+        } catch (error) {
+            node.debug("Error closing obsolete subscription (ignored): " + error);
+        }
+        return;
+    }
     node.debug("Subscription created");
 
     node.subscription = subscription;
@@ -396,6 +406,7 @@ module.exports = function(RED) {
         };
 
         node.monitoredItems = {};
+        node.monitoringRevision = 0;
 
         // BROWSE
         node.depth = config.depth || 1;
@@ -430,14 +441,14 @@ module.exports = function(RED) {
                 if (node.mode === "subscribe") {
                     if (!isObjectEmpty(node.monitoredItems)) {
                         await initializeSubscription(node);
-                        await subscribeItems(node, node.monitoredItems);
+                        if (node.subscription) await subscribeItems(node, node.monitoredItems);
                     } else {
                         node.status({fill:"green",shape:"dot",text:"connected"});
                     }
                 } else if (node.mode === "alarm") {
                     if (!isObjectEmpty(node.monitoredItems)) {
                         await initializeSubscription(node);
-                        await subscribeEvents(node, node.monitoredItems);
+                        if (node.subscription) await subscribeEvents(node, node.monitoredItems);
                     } else {
                         node.status({fill:"green",shape:"dot",text:"connected"});
                     }
@@ -506,6 +517,12 @@ module.exports = function(RED) {
                 node.endpoint.recover("requested by msg.reconnect");
                 return;
             }
+            if ((node.mode === "subscribe" || node.mode === "alarm") && msg.hasOwnProperty("reset") && node.session) {
+                node.monitoringRevision++;
+                node.monitoredItems = {};
+                await serialize(() => handleSubscriptionAndEvents(node, msg));
+                return;
+            }
             if (!node.session) {
                 node.error("Impossible to execute operation, client is not connected to the OPC UA server.", msg)
                 // The endpoint is connected but this node lost its session: try to get a new one
@@ -524,7 +541,7 @@ module.exports = function(RED) {
                 case "subscribe":
                 case "alarm":
                 {
-                    await handleSubscriptionAndEvents(node, msg)
+                    await serialize(() => handleSubscriptionAndEvents(node, msg))
                     break;
                 }
                 case "browse": {
@@ -542,6 +559,7 @@ module.exports = function(RED) {
         });
         node.on("close", async (done) => {
             node.closing = true;
+            node.monitoringRevision++;
             // NOTE: the endpoint may outlive this node (partial deploy), so the listeners must be removed
             node.endpoint.removeListener("CONNECTING", onConnecting);
             node.endpoint.removeListener("CONNECTED", onConnected);
@@ -823,15 +841,15 @@ async function handleBrowse(node, msg) {
 }
 
 async function handleSubscriptionAndEvents(node, msg) {
+    if (node.closing) return;
     if (msg.hasOwnProperty("reset")) {
-        // NOTE: Terminating the subscription also deletes all the monitoredItems
-        if (node.subscription) {
-            await closeSubscription(node)
-            node.monitoredItems = {};
-            node.status({fill:"green",shape:"dot",text:"connected"});
-        }
+        // Clear intent even if initialization never produced a subscription.
+        node.monitoredItems = {};
+        await closeSubscription(node);
+        if (!node.closing && node.session) node.status({fill:"green",shape:"dot",text:"connected"});
         return;
     }
+    const revision = node.monitoringRevision;
 
     if (!msg.payload || typeof msg.payload !== 'object') {
         node.error(`Invalid input ${JSON.stringify(msg.payload)}: payload should be an object with variable names as keys and OPC UA tags as values.`, msg);
@@ -863,11 +881,15 @@ async function handleSubscriptionAndEvents(node, msg) {
     try {
         await initializeSubscription(node);
     } catch (err) {
+        if (node.closing || revision !== node.monitoringRevision) return;
         node.error(`Error initializing subscription: ${err}`, msg);
         checkSessionError(node, err);
         return;
     }
     
+    if (!node.subscription || node.closing || revision !== node.monitoringRevision) return;
+    const subscription = node.subscription;
+
     // Prepare read requests to check if event types exist
     const itemsToRead = Object.values(node.monitoredItems).map((nodeId) => ({
         nodeId: nodeId,
@@ -878,10 +900,13 @@ async function handleSubscriptionAndEvents(node, msg) {
     try {
         dataValues = await node.session.read(itemsToRead);
     } catch (err) {
+        if (node.closing || revision !== node.monitoringRevision) return;
         node.error(`Error preprocessing event types: ${err}`, msg);
         checkSessionError(node, err);
         return;
     }
+
+    if (node.closing || subscription !== node.subscription || revision !== node.monitoringRevision) return;
 
     // Check if the nodes are of NodeClass ObjectType (event types)
     Object.keys(node.monitoredItems).forEach((key, index) => {
@@ -906,19 +931,23 @@ async function handleSubscriptionAndEvents(node, msg) {
     }
 
     if (node.mode === "subscribe") {
-        subscribeItems(node, node.monitoredItems)
+        await subscribeItems(node, node.monitoredItems)
     }
     else if (node.mode === "alarm") {
         // TODO: finetune the maximum amount of items
         if (Object.keys(node.monitoredItems).length > 4) {
             node.warn(`Subscribing to more than 4 events is not recommanded! Alternatively, you can split the load across multiple nodes.`)
         }
-        subscribeEvents(node, node.monitoredItems)
+        await subscribeEvents(node, node.monitoredItems)
     }
     // NOTE: Maybe we should return a msg.
 }
 
 async function subscribeItems(node, monitoredItems) {
+    monitoredItems = { ...monitoredItems };
+    const subscription = node.subscription;
+    const revision = node.monitoringRevision;
+    const current = () => !node.closing && subscription === node.subscription && revision === node.monitoringRevision;
     const processedItems = preprocessItems(monitoredItems);
     try {
         const itemGroup = opcua.ClientMonitoredItemGroup.create(
@@ -929,15 +958,17 @@ async function subscribeItems(node, monitoredItems) {
         )
 
         itemGroup.on("initialized", () => {
+            if (!current()) return;
             node.status({ fill: "green", shape: "dot", text: `${Object.keys(monitoredItems).length} items subscribed`});
         })
-        itemGroup.on("err", (message) => node.error(`Item group error: ${message}`, {}));
+        itemGroup.on("err", (message) => { if (current()) node.error(`Item group error: ${message}`, {}); });
         itemGroup.on("changed", (_, dataValue, index) => {
+            if (!current()) return;
             
             const key = Object.keys(monitoredItems)[index];
             // NOTE: need to create a new message to avoid msgid conflict
             // if I do not do that, 'key' is not attached correctly
-            msg = {
+            const msg = {
                 "payload": {
                     [key]: {
                         ...dataValue,
@@ -959,11 +990,16 @@ async function subscribeItems(node, monitoredItems) {
 }
 
 async function subscribeEvents(node, monitoredItems) {
+    monitoredItems = { ...monitoredItems };
+    const subscription = node.subscription;
+    const revision = node.monitoringRevision;
+    const current = () => !node.closing && subscription === node.subscription && revision === node.monitoringRevision;
 
     try {
         for (const [key, value] of Object.entries(monitoredItems)) {
             const eventTypeId = opcua.resolveNodeId(value);
             const fields = await opcua.extractConditionFields(node.session, eventTypeId);
+            if (!current()) return;
             const eventFilter = opcua.constructEventFilter(fields, opcua.ofType(eventTypeId));
 
             const itemGroup = opcua.ClientMonitoredItem.create(
@@ -978,12 +1014,14 @@ async function subscribeEvents(node, monitoredItems) {
             )
 
             itemGroup.on("initialized", async () => {
+                if (!current()) return;
                 // NOTE: I'm not sure this is needed
                 await opcua.callConditionRefresh(node.session, node.subscription.subscriptionId);
             })
-            itemGroup.on("err", (message) => node.error(`Event group error: ${message}`, {}));
+            itemGroup.on("err", (message) => { if (current()) node.error(`Event group error: ${message}`, {}); });
             itemGroup.on("changed", (dataValue) => {
-                msg = {
+                if (!current()) return;
+                const msg = {
                     "payload": {
                         [key]: opcua.fieldsToJson(fields, dataValue, false)
                     }
@@ -992,7 +1030,7 @@ async function subscribeEvents(node, monitoredItems) {
                 node.send(msg);
             });
         }
-        node.status({ fill: "green", shape: "dot", text: `${Object.keys(node.monitoredItems).length} events subscribed`});
+        if (current()) node.status({ fill: "green", shape: "dot", text: `${Object.keys(node.monitoredItems).length} events subscribed`});
     } catch (error) {
         node.error(error, {});
         node.status({ fill: "red", shape: "dot", text: "error"});
