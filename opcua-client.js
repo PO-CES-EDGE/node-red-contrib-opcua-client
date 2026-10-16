@@ -46,6 +46,7 @@ const options = {
 // when its connection/reconnection attempts have stopped making progress.
 const RECOVERY_CHECK_INTERVAL = 5000;
 const RECOVERY_NO_PROGRESS = 60000;
+const INITIALIZATION_TIMEOUT = 10000;
 const CLOSE_TIMEOUT = 5000; // bound cleanup when a server does not acknowledge close
 
 // Temporary server capacity failures can be retried without replacing the shared client.
@@ -173,15 +174,29 @@ async function closeSession(node) {
 async function initializeSubscription(node) {
     const session = node.session;
     const revision = node.monitoringRevision;
-    const subscription = await session.createSubscription2(node.subscriptionOptions);
-    if (node.closing || session !== node.session || revision !== node.monitoringRevision) {
-        try {
-            await withTimeout(subscription.terminate(), CLOSE_TIMEOUT, "Late subscription close");
-        } catch (error) {
-            node.debug("Error closing obsolete subscription (ignored): " + error);
+    let obsolete = false;
+    const pending = session.createSubscription2(node.subscriptionOptions).then(async (subscription) => {
+        if (obsolete || node.closing || session !== node.session || revision !== node.monitoringRevision) {
+            try {
+                await withTimeout(subscription.terminate(), CLOSE_TIMEOUT, "Late subscription close");
+            } catch (error) {
+                node.debug("Error closing obsolete subscription (ignored): " + error);
+            }
+            return null;
         }
-        return;
+        return subscription;
+    });
+    let subscription;
+    try {
+        subscription = await withTimeout(pending, INITIALIZATION_TIMEOUT, "Subscription creation");
+    } catch (error) {
+        obsolete = true;
+        if (/timed out|BadTimeout|BadRequestTimeout/i.test(`${error.message || error}`)) {
+            error.subscriptionCreationTimedOut = true;
+        }
+        throw error;
     }
+    if (!subscription) return;
     node.debug("Subscription created");
 
     node.subscription = subscription;
@@ -516,8 +531,17 @@ module.exports = function(RED) {
                 if (node.closing || revision !== node.monitoringRevision) return;
                 node.error(`Error initializing subscription: ${error}`, {});
                 node.status({ fill: "red", shape: "dot", text: "error" });
-                checkSessionError(node, error);
-                node.scheduleRetry(error);
+                if (error.subscriptionCreationTimedOut) {
+                    // The server may still create a subscription whose id was never received.
+                    // Closing only this node's session also deletes that uncertain resource.
+                    await closeSubscription(node);
+                    await closeSession(node);
+                    if (node.closing || revision !== node.monitoringRevision) return;
+                    node.scheduleRetry(new Error("BadResourceUnavailable"));
+                } else {
+                    checkSessionError(node, error);
+                    node.scheduleRetry(error);
+                }
             }
         };
 
