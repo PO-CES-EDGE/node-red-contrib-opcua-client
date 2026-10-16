@@ -348,6 +348,11 @@ msg.payload = {
 
 **Note**: The server may adjust these values based on its performance capabilities and resource constraints.
 
+### Connection recovery
+The connection is recovered automatically: the connection is retried forever, the OPC UA client is recreated if it stops retrying, and sessions and subscriptions are restored.
+#### Inputs
+: reconnect (boolean) : In any mode, a message with `msg.reconnect = true` forces the OPC UA client to be recreated.
+
 ### References
 - [OPC UA Documentation](https://reference.opcfoundation.org/)
 - [node-opcua](https://node-opcua.github.io/)

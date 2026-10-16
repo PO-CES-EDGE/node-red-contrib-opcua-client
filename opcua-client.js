@@ -22,7 +22,8 @@ const securityPolicies = {
 }
 
 const connectionStrategy = {
-    maxRetry: 1,
+    // NOTE: retry the initial connection forever, as node-opcua already does after a connection loss
+    maxRetry: -1,
     initialDelay: 1000,
     maxDelay: 5000
 };
@@ -41,6 +42,19 @@ const options = {
     automaticallyAcceptUnknownCertificate: true
 }
 
+// Let node-opcua handle normal retries. Recreate a disconnected client only
+// when its connection/reconnection attempts have stopped making progress.
+const RECOVERY_CHECK_INTERVAL = 5000;
+const RECOVERY_NO_PROGRESS = 60000;
+const INITIALIZATION_TIMEOUT = 10000;
+const CLOSE_TIMEOUT = 5000; // bound cleanup when a server does not acknowledge close
+
+// Temporary server capacity failures can be retried without replacing the shared client.
+const TEMPORARY_CAPACITY_ERROR = /BadTooManySessions|BadTooManySubscriptions|BadTooManyMonitoredItems|BadResourceUnavailable|BadServerTooBusy|BadOutOfMemory|BadTcpNotEnoughResources/;
+
+// Errors meaning the session is unusable, even though the endpoint may still look connected
+const SESSION_LOST_ERROR = /BadSession|BadSecureChannel|BadConnectionClosed|BadNotConnected|BadServerNotConnected|session.*(closed|invalid)|not connected/i;
+
 const subscriptionOptions = {
     maxNotificationsPerPublish: 1000,
     publishingEnabled: true,
@@ -49,7 +63,7 @@ const subscriptionOptions = {
     requestedPublishingInterval: 1000
 };
 
-const monitoredItemsOptions = 
+const monitoredItemsOptions =
 {
     samplingInterval: 100,
     discardOldest: true,
@@ -66,6 +80,14 @@ function delay(ms) {
     });
 }
 
+function withTimeout(promise, ms, operation) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${operation} timed out after ${ms} ms`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 const DISCONNECTED = 0;
 const CONNECTING = 1;
 const CONNECTED = 2;
@@ -74,61 +96,130 @@ const ERROR = 3;
 async function initializeClient(node, client, endpointUrl) {
     try {
         await client.connect(endpointUrl);
+        // NOTE: the client may have been replaced or closed while connecting
+        if (client !== node.client) return;
         node.state = CONNECTED;
         node.log(`Connected to OPC UA server at ${endpointUrl}`);
     } catch (error) {
+        if (client !== node.client) return;
         node.state = ERROR;
+        node.lastProgress = Date.now();
         // NOTE: no need to throw any error. The error is already propagated using the 'connection_failed' event.
+        // The watchdog will recreate the client and try again.
     }
 }
 
 async function disconnectClient(node, client) {
+    if (!client) return;
     try {
         client.removeAllListeners()
-        await client.disconnect();
-        node.state = DISCONNECTED;
+        await withTimeout(client.disconnect(), CLOSE_TIMEOUT, "Disconnect");
         node.log(`Disconnected from OPC UA server at ${node.endpoint}`);
-        node.client = null;
     } catch (error) {
-        node.state = ERROR;
-        throw new Error(`Failed to disconnect to OPC UA server: ${error}`);
+        node.warn(`Failed to disconnect cleanly from OPC UA server at ${node.endpoint}: ${error.message}`);
     }
 }
 
-async function initializeSession(node, client) {
-    // If the server does not handle concurrency very well, we do not want to send the createSession concurrently 
+async function initializeSession(node) {
+    // If the server does not handle concurrency very well, we do not want to send the createSession concurrently
     // TODO: find a better way to solve this.
     await delay(Math.random() * 1000);
+    if (node.closing) return;
+    const client = node.endpoint.client;
+    if (!client || node.endpoint.state !== CONNECTED) {
+        throw new Error("client is not connected to the OPC UA server");
+    }
     const session = await client.createSession(node.endpoint.userIdentity);
+    // Close may finish while CreateSession is still in flight.
+    if (node.closing || client !== node.endpoint.client || node.endpoint.state !== CONNECTED) {
+        try {
+            await withTimeout(session.close(), CLOSE_TIMEOUT, "Late session close");
+        } catch (error) {
+            node.debug("Error closing obsolete session (ignored): " + error);
+        }
+        return;
+    }
     node.debug("Session created");
+
+    // NOTE: events from a session that has already been replaced are ignored
+    session.on("keepalive", () => {
+        if (session !== node.session) return;
+        node.debug(`keepalive ${node.name}`);
+    });
+    session.on("keepalive_failure", () => {
+        node.debug(`keepalive_failure ${node.name}: ${node.endpoint.state}`);
+        node.recoverSession(session, "keep-alive failed");
+    });
+    session.on("session_closed", () => {
+        node.debug(`session_closed ${node.name}`);
+        node.recoverSession(session, "session closed by the server");
+    });
 
     node.session = session;
 }
 
 async function closeSession(node) {
+    // NOTE: forget the session first, so that a slow close cannot erase a session created in the meantime
+    const session = node.session;
+    node.session = null;
+    if (!session) return;
     try {
-        await node.session.close();
-        node.session = null;
+        await withTimeout(session.close(), CLOSE_TIMEOUT, "Session close");
         node.debug("Session closed");
     } catch (error) {
-        node.error("Error during session close: " + error);
+        node.debug("Error during session close (ignored): " + error);
     }
 }
 
 async function initializeSubscription(node) {
-    const subscription = await node.session.createSubscription2(node.subscriptionOptions);
+    const session = node.session;
+    const revision = node.monitoringRevision;
+    let obsolete = false;
+    const pending = session.createSubscription2(node.subscriptionOptions).then(async (subscription) => {
+        if (obsolete || node.closing || session !== node.session || revision !== node.monitoringRevision) {
+            try {
+                await withTimeout(subscription.terminate(), CLOSE_TIMEOUT, "Late subscription close");
+            } catch (error) {
+                node.debug("Error closing obsolete subscription (ignored): " + error);
+            }
+            return null;
+        }
+        return subscription;
+    });
+    let subscription;
+    try {
+        subscription = await withTimeout(pending, INITIALIZATION_TIMEOUT, "Subscription creation");
+    } catch (error) {
+        obsolete = true;
+        if (/timed out|BadTimeout|BadRequestTimeout/i.test(`${error.message || error}`)) {
+            error.subscriptionCreationTimedOut = true;
+        }
+        throw error;
+    }
+    if (!subscription) return;
     node.debug("Subscription created");
 
     node.subscription = subscription;
+    subscription.on("terminated", () => node.recoverSubscription(subscription));
 }
 
 async function closeSubscription(node) {
+    const subscription = node.subscription;
+    node.subscription = null;
+    node.activeItems = {};
+    if (!subscription) return;
     try {
-        await node.subscription.terminate();
-        node.subscription = null;
+        await withTimeout(subscription.terminate(), CLOSE_TIMEOUT, "Subscription close");
         node.debug("Subscription closed");
     } catch (error) {
-        node.error("Error during subscription close: ", + error);
+        node.debug("Error during subscription close (ignored): " + error);
+    }
+}
+
+// Rebuild the session when an operation fails because the session is gone
+function checkSessionError(node, error) {
+    if (SESSION_LOST_ERROR.test(`${error && error.message || error}`)) {
+        node.recoverSession(node.session, `operation failed: ${error.message || error}`);
     }
 }
 
@@ -146,12 +237,12 @@ function preprocessItems(items) {
 
 module.exports = function(RED) {
     function OPCUAClientEndpoint(config) {
-        EventEmitter.call(this); 
+        EventEmitter.call(this);
         // Avoid warnings
         this.setMaxListeners(0);
 
         RED.nodes.createNode(this, config);
-        
+
         // USER INPUTS
         this.endpoint = config.endpoint;
         this.securityMode = config.securityMode;
@@ -166,69 +257,136 @@ module.exports = function(RED) {
         }
 
         this.state = DISCONNECTED;
-
-        this.client = opcua.OPCUAClient.create(options);
+        this.client = null;
+        this.closing = false;
+        this.recycling = false;
+        this.lastProgress = Date.now();
 
         const onConnect = () => {
             this.state = CONNECTED;
+            this.lastProgress = Date.now();
             this.emit("CONNECTED");
             this.debug("connected");
         }
         const onConnectFail = (error) => {
             this.state = ERROR;
+            this.lastProgress = Date.now();
             this.emit("ERROR", error);
             this.debug("connection_failed");
         }
         const onBackoff = (count, _) => {
             this.state = CONNECTING;
+            this.lastProgress = Date.now();
             this.emit("CONNECTING", count);
             this.debug("backoff", count);
         }
         const onStartReconnecting = () => {
             this.state = CONNECTING;
+            this.lastProgress = Date.now();
             this.emit("CONNECTING");
             this.debug("start_reconnection");
         }
-        const onConnectionLost = () => { 
+        const onConnectionLost = () => {
+            // NOTE: node-opcua is now reconnecting, the sessions cannot be used until "connection_reestablished"
+            this.state = CONNECTING;
+            this.lastProgress = Date.now();
             this.emit("ERROR", new Error(`Connection lost!`));
             this.debug("connection_lost");
         }
-        const onConnectionReestablished = () => { 
+        const onConnectionReestablished = () => {
             this.state = CONNECTED;
+            this.lastProgress = Date.now();
             this.emit("CONNECTED");
             this.debug("connection_reestablished");
         }
         const onTimeoutRequest = (request) => {
-            this.state = ERROR;
-            this.emit("ERROR", new Error(`${request} timed out!`));
+            const requestName = request && request.constructor ? request.constructor.name : `${request}`;
+            this.warn(`${requestName} timed out`);
             this.debug("timed_out_request");
         }
+
+        const createClient = () => {
+            const client = opcua.OPCUAClient.create(options);
+            // NOTE: events from a client that has already been replaced must not change the state
+            const on = (event, handler) => client.on(event, (...args) => {
+                if (client === this.client) handler(...args);
+            });
+
+            on("connected", onConnect); // CONNECTED
+            // NOTE: "connection_failed" occurs after {'maxRetry'} 'backoff'
+            on("connection_failed", onConnectFail); // ERROR
+            on("backoff", onBackoff); // CONNECTING
+            on("start_reconnection", onStartReconnecting); // CONNECTING
+
+            on("reconnection_attempt_has_failed", () => {
+                this.lastProgress = Date.now();
+                this.debug("reconnection_attempt_has_failed");
+            });
+            on("abort", () => this.debug("abort"));
+            on("close", () => this.debug("close"));
+
+            on("connection_lost", onConnectionLost);
+            on("connection_reestablished", onConnectionReestablished); // CONNECTED
+
+            on("timed_out_request", onTimeoutRequest);
+            return client;
+        }
+
+        // Same as a flow restart: throw the client away and connect with a new one
+        const recycleClient = async (reason) => {
+            this.recycling = true;
+            this.warn(`Recreating OPC UA client for ${this.endpoint}: ${reason}`);
+
+            const oldClient = this.client;
+            this.client = null;
+            this.state = CONNECTING;
+            // Sessions belong to the old client, the client nodes must drop them
+            this.emit("RESET");
+            this.emit("CONNECTING");
+            try {
+                await disconnectClient(this, oldClient);
+            } finally {
+                this.recycling = false;
+            }
+            if (this.closing) return;
+
+            this.lastProgress = Date.now();
+            this.client = createClient();
+            await initializeClient(this, this.client, this.endpoint);
+        }
+
+        // Manual recovery is explicit; individual request/session failures
+        // must not recycle the connection shared by otherwise healthy nodes.
+        this.recover = (reason) => {
+            if (this.closing || this.recycling) return;
+            recycleClient(reason).catch((error) => this.error(`Client recovery failed: ${error}`));
+        };
+
+        const watchdog = () => {
+            if (this.closing || this.recycling || this.state === CONNECTED) return;
+            const stalledFor = Date.now() - this.lastProgress;
+            if (stalledFor >= RECOVERY_NO_PROGRESS) {
+                this.recover(`no connection progress for ${Math.round(stalledFor / 1000)}s`);
+            }
+        };
 
         this.state = CONNECTING
         this.emit("CONNECTING");
 
-        this.client.on("connected", onConnect); // CONNECTED
-        // NOTE: "connection_failed" occurs after {'maxRetry'} 'backoff' 
-        this.client.on("connection_failed", onConnectFail); // ERROR
-        this.client.on("backoff", onBackoff); // CONNECTING
-        this.client.on("start_reconnection", onStartReconnecting); // CONNECTING
-
-        // NOTE: I was never able to get this event
-        this.client.on("reconnection_attempt_has_failed", () => this.debug("reconnection_attempt_has_failed"));
-        this.client.on("abort", () => this.debug("abort"));
-        this.client.on("close", () => this.debug("close"));
-
-        this.client.on("connection_lost", onConnectionLost);
-        this.client.on("connection_reestablished", onConnectionReestablished); // CONNECTED
-        
-        this.client.on("timed_out_request", onTimeoutRequest); // ERROR
-
+        this.client = createClient();
         (async () => { await initializeClient(this, this.client, this.endpoint) })();
-        
+
+        this.watchdogTimer = setInterval(watchdog, RECOVERY_CHECK_INTERVAL);
+
         this.on("close", async (done) => {
+            this.closing = true;
+            clearInterval(this.watchdogTimer);
             this.removeAllListeners();
+            const client = this.client;
+            this.client = null;
             // NOTE: disconnecting the client should also remove all the client listeners
-            await disconnectClient(this, this.client);
+            await disconnectClient(this, client);
+            this.state = DISCONNECTED;
             if (done) done();
         })
     }
@@ -242,7 +400,7 @@ module.exports = function(RED) {
     function OPCUAClient(config) {
         RED.nodes.createNode(this, config);
         var node = this;
-        
+
         node.name = config.name;
         node.endpoint = RED.nodes.getNode(config.endpoint);
         if (!node.endpoint) {
@@ -251,7 +409,7 @@ module.exports = function(RED) {
             node.on("input", async () => {node.error("Cannot execute operation: missing OPC UA endpoint configuration!")});
             return;
         }
-        
+
         node.mode = config.mode;
         // READ
         // SUBSCRIBE & EVENTS
@@ -259,99 +417,202 @@ module.exports = function(RED) {
             ...subscriptionOptions,
             requestedPublishingInterval: parseInt(config.publishingInterval)
         };
-        
-        node.monitoredItemsOptions = 
+
+        node.monitoredItemsOptions =
         {
             ...monitoredItemsOptions,
             samplingInterval: parseInt(config.samplingInterval),
             queueSize: parseInt(config.queueSize),
         };
-        
+
         node.monitoredItems = {};
+        node.activeItems = {};
+        node.monitoringRevision = 0;
 
         // BROWSE
         node.depth = config.depth || 1;
         // TODO: this could be a user input
         node.maxConcurrentRequests = 100;
-        
-        const {client, state} = node.endpoint;
 
         node.session = null;
         node.subscription = null;
-        
-        node.endpoint.on("CONNECTING", async (count) => {
+        node.closing = false;
+
+        // NOTE: session and subscription changes run one at a time, otherwise a reconnection
+        // can interleave with an error cleanup and leave the node without a valid session
+        node.lifecycle = Promise.resolve();
+        const serialize = (task) => {
+            node.lifecycle = node.lifecycle.then(task).catch((error) => node.error(`${error}`, {}));
+            return node.lifecycle;
+        };
+
+        node.retryTimer = null;
+        node.retryDelay = 1000;
+        node.cancelRetry = () => {
+            clearTimeout(node.retryTimer);
+            node.retryTimer = null;
+            node.retryDelay = 1000;
+        };
+        node.scheduleRetry = (error) => {
+            if (!TEMPORARY_CAPACITY_ERROR.test(`${error.message || error}`)) return;
+            if (node.closing || node.retryTimer || node.endpoint.state !== CONNECTED) return;
+            const revision = node.monitoringRevision;
+            node.retryTimer = setTimeout(() => {
+                node.retryTimer = null;
+                serialize(async () => {
+                    if (node.closing || revision !== node.monitoringRevision || node.endpoint.state !== CONNECTED) return;
+                    if (!node.session) await setupSession();
+                    else await node.restoreMonitoring();
+                });
+            }, node.retryDelay);
+            node.retryDelay = Math.min(node.retryDelay * 2, 10000);
+        };
+
+        // NOTE: clean previous sessions and subscription if needed and create new one
+        // If this is called after a reconnection, we cannot guarantee that sessions and subscriptions are still valid.
+        // Just in case, we recreate everything
+        const setupSession = async () => {
+            if (node.closing) return;
+            if (node.subscription) await closeSubscription(node);
+            if (node.session) await closeSession(node);
+            if (node.endpoint.state !== CONNECTED) return;
+
+            try {
+                await initializeSession(node);
+                if (node.closing || !node.session) return;
+                node.cancelRetry();
+
+                if (node.mode === "subscribe" || node.mode === "alarm") {
+                    await node.restoreMonitoring();
+                } else {
+                    node.status({fill:"green",shape:"dot",text:"connected"});
+                }
+            }
+            catch (error) {
+                if (node.closing) return;
+                node.scheduleRetry(error);
+                node.error(`Error initializing OPC UA session: ${error}`);
+                node.status({ fill: "red", shape: "dot", text: "error" });
+            }
+        };
+
+        node.restoreMonitoring = async () => {
+            if (node.closing || !node.session || node.endpoint.state !== CONNECTED) return;
+            const revision = node.monitoringRevision;
+            if (isObjectEmpty(node.monitoredItems)) {
+                node.cancelRetry();
+                node.status({fill:"green",shape:"dot",text:"connected"});
+                return;
+            }
+            try {
+                if (!node.subscription) await initializeSubscription(node);
+                if (node.closing || !node.subscription || revision !== node.monitoringRevision) return;
+                const pendingItems = {};
+                for (const [key, value] of Object.entries(node.monitoredItems)) {
+                    if (!node.activeItems.hasOwnProperty(key)) pendingItems[key] = value;
+                }
+                if (!isObjectEmpty(pendingItems)) {
+                    if (node.mode === "subscribe") {
+                        await subscribeItems(node, pendingItems);
+                    } else {
+                        await subscribeEvents(node, pendingItems);
+                    }
+                }
+                if (node.closing || revision !== node.monitoringRevision) return;
+                if (Object.keys(node.activeItems).length < Object.keys(node.monitoredItems).length) {
+                    node.scheduleRetry(new Error("BadTooManyMonitoredItems"));
+                } else {
+                    node.cancelRetry();
+                }
+                const count = Object.keys(node.activeItems).length;
+                const kind = node.mode === "alarm" ? "events" : "items";
+                node.status({ fill: "green", shape: "dot", text: `${count} ${kind} subscribed`});
+            } catch (error) {
+                if (node.closing || revision !== node.monitoringRevision) return;
+                node.error(`Error initializing subscription: ${error}`, {});
+                node.status({ fill: "red", shape: "dot", text: "error" });
+                if (error.subscriptionCreationTimedOut) {
+                    // The server may still create a subscription whose id was never received.
+                    // Closing only this node's session also deletes that uncertain resource.
+                    await closeSubscription(node);
+                    await closeSession(node);
+                    if (node.closing || revision !== node.monitoringRevision) return;
+                    node.scheduleRetry(new Error("BadResourceUnavailable"));
+                } else if (error.monitoredItemCreationTimedOut) {
+                    // A timed-out create may still allocate items. Delete their subscription
+                    // before retrying so late completion cannot leave duplicate monitoring.
+                    await closeSubscription(node);
+                    if (node.closing || revision !== node.monitoringRevision) return;
+                    node.scheduleRetry(new Error("BadResourceUnavailable"));
+                } else {
+                    checkSessionError(node, error);
+                    node.scheduleRetry(error);
+                }
+            }
+        };
+
+        node.recoverSubscription = (subscription) => {
+            if (node.closing || subscription !== node.subscription) return;
+            // Clear ownership before queuing recovery so obsolete callbacks are ignored.
+            node.subscription = null;
+            node.activeItems = {};
+            node.cancelRetry();
+            const revision = node.monitoringRevision;
+            serialize(async () => {
+                if (node.closing || revision !== node.monitoringRevision) return;
+                await node.restoreMonitoring();
+            });
+        };
+
+        // Recreate the session if 'session' is still the current one
+        node.recoverSession = (session, reason) => {
+            if (node.closing || !session || session !== node.session) return;
+            if (node.endpoint.state !== CONNECTED) return; // the endpoint will emit CONNECTED when it is back
+            node.warn(`Recreating OPC UA session: ${reason}`);
+            serialize(async () => {
+                if (session === node.session) await setupSession();
+            });
+        };
+
+        const onConnecting = (count) => {
+            node.cancelRetry();
+            if (node.closing) return;
             if (count) {
                 node.status({ fill: "yellow", shape: "dot", text: `connecting: attempt #${count}`});
             } else {
                 node.status({ fill: "yellow", shape: "dot", text: `connecting`});
             }
-        })
-
-        node.endpoint.on("CONNECTED", async () => {
-            // NOTE: clean previous sessions and subscription if needed and create new one
-            // If this event is triggered after a reconnection, we cannot guarantee that sessions and subscriptions are still valid.
-            // Just in case, we recreate everything
-            if (node.subscription) await closeSubscription(node);
-            if (node.session) await closeSession(node);
-                
-            try {
-                await initializeSession(node, client);
-                
-                node.session.on("keepalive", () => node.debug(`keepalive ${node.name}`))
-                node.session.on("keepalive_failure", () => node.debug(`keepalive_failure ${node.name}: ${state}`));
-                
-                if (node.mode === "subscribe") {
-                    if (!isObjectEmpty(node.monitoredItems)) {
-                        await initializeSubscription(node);
-                        await subscribeItems(node, node.monitoredItems);
-                    } else {
-                        node.status({fill:"green",shape:"dot",text:"connected"});
-                    }
-                } else if (node.mode === "alarm") {
-                    if (!isObjectEmpty(node.monitoredItems)) {
-                        await initializeSubscription(node);
-                        await subscribeEvents(node, node.monitoredItems);
-                    } else {
-                        node.status({fill:"green",shape:"dot",text:"connected"});
-                    }
-                } else {
-                    node.status({fill:"green",shape:"dot",text:"connected"});
-                }
-
-            }
-            catch (error) {
-                node.error(`Error initializing OPC UA session: ${error}`);
+        };
+        const onConnected = () => serialize(setupSession);
+        const onError = (err) => {
+            node.cancelRetry();
+            return serialize(async () => {
+                if (node.closing) return;
+                if (node.subscription) await closeSubscription(node);
+                if (node.session) await closeSession(node);
+                node.error(`ERROR: ${err.message}`, {});
                 node.status({ fill: "red", shape: "dot", text: "error" });
-            }
-        });
-        
-        node.endpoint.on("ERROR", async (err) => {
-            if (node.subscription) await closeSubscription(node);
-            if (node.session) await closeSession(node);
-            node.error(`ERROR: ${err.message}`, {});
-            node.status({ fill: "red", shape: "dot", text: "error" });
-        })
+            });
+        };
+        // The client is being recreated: its sessions are closed with it
+        const onReset = () => {
+            node.cancelRetry();
+            return serialize(async () => {
+                node.subscription = null;
+                node.activeItems = {};
+                node.session = null;
+            });
+        };
+
+        node.endpoint.on("CONNECTING", onConnecting);
+        node.endpoint.on("CONNECTED", onConnected);
+        node.endpoint.on("ERROR", onError);
+        node.endpoint.on("RESET", onReset);
 
         // NOTE: This code is required if a new client node is instantiated using an already connected endpoint.
+        const state = node.endpoint.state;
         if (state === CONNECTED) {
-            // NOTE: in this case we do not need to close any session or subscription,
-            // we are sure that they were not created before
-            (async () => {
-                try {
-                    if (!node.session) {
-                        await initializeSession(node, client);
-                    }
-                    
-                    node.session.on("keepalive", () => node.debug(`keepalive ${node.name}`))
-                    node.session.on("keepalive_failure", () => node.debug(`keepalive_failure ${node.name}: ${state}`));
-                    
-                    node.status({fill:"green",shape:"dot",text:"connected"});
-                }
-                catch (error) {
-                    node.error(`Error initializing OPC UA session: ${error}`, {})
-                    node.status({ fill: "red", shape: "dot", text: "error" });
-                }
-            })();
+            serialize(setupSession);
         } else if (state === CONNECTING) {
             node.status({ fill: "yellow", shape: "dot", text: "connecting"});
         } else if (state === ERROR) {
@@ -360,9 +621,28 @@ module.exports = function(RED) {
             node.status({ fill: "red", shape: "dot", text: "disconnected"});
         }
 
-        node.on("input", async (msg) => { 
-            if (!node.session) {
+        node.on("input", async (msg) => {
+            if (node.closing) return;
+            // Manual recovery from a flow: recreate the OPC UA client, like a flow restart
+            if (msg.reconnect) {
+                node.endpoint.recover("requested by msg.reconnect");
+                return;
+            }
+            if ((node.mode === "subscribe" || node.mode === "alarm") && msg.hasOwnProperty("reset")) {
+                node.monitoringRevision++;
+                node.cancelRetry();
+                node.monitoredItems = {};
+                await serialize(() => handleSubscriptionAndEvents(node, msg));
+                return;
+            }
+            if (!node.session || node.endpoint.state !== CONNECTED) {
                 node.error("Impossible to execute operation, client is not connected to the OPC UA server.", msg)
+                // The endpoint is connected but this node lost its session: try to get a new one
+                if (node.endpoint.state === CONNECTED) {
+                    serialize(async () => {
+                        if (!node.session) await setupSession();
+                    });
+                }
                 return;
             };
             switch (node.mode) {
@@ -373,7 +653,11 @@ module.exports = function(RED) {
                 case "subscribe":
                 case "alarm":
                 {
-                    await handleSubscriptionAndEvents(node, msg)
+                    const revision = node.monitoringRevision;
+                    await serialize(() => {
+                        if (revision !== node.monitoringRevision) return;
+                        return handleSubscriptionAndEvents(node, msg);
+                    });
                     break;
                 }
                 case "browse": {
@@ -390,6 +674,15 @@ module.exports = function(RED) {
             }
         });
         node.on("close", async (done) => {
+            node.closing = true;
+            node.cancelRetry();
+            node.monitoringRevision++;
+            // NOTE: the endpoint may outlive this node (partial deploy), so the listeners must be removed
+            node.endpoint.removeListener("CONNECTING", onConnecting);
+            node.endpoint.removeListener("CONNECTED", onConnected);
+            node.endpoint.removeListener("ERROR", onError);
+            node.endpoint.removeListener("RESET", onReset);
+            node.recoverSession = () => {};
             if (node.subscription) await closeSubscription(node);
             if (node.session) await closeSession(node);
             if (done) done();
@@ -445,6 +738,7 @@ async function handleRead(node, msg) {
     }
     catch (err) {
         node.error(`${err}`, msg);
+        checkSessionError(node, err);
     }
 }
 
@@ -572,6 +866,7 @@ async function handleWrite(node, msg) {
         // NOTE: Maybe we should return a msg.
     } catch (error) {
         node.error(`Error writing to OPC UA server: ${error.message}`, msg);
+        checkSessionError(node, error);
     }
 }
 
@@ -648,6 +943,7 @@ async function handleBrowse(node, msg) {
         } catch (error) {
             node.error(error.message, {});
             node.status({ fill: "red",  shape: "dot", text: "error"})
+            checkSessionError(node, error);
 
             // RESET status after 5 seconds
             setTimeout(() => {
@@ -662,15 +958,15 @@ async function handleBrowse(node, msg) {
 }
 
 async function handleSubscriptionAndEvents(node, msg) {
+    if (node.closing) return;
     if (msg.hasOwnProperty("reset")) {
-        // NOTE: Terminating the subscription also deletes all the monitoredItems
-        if (node.subscription) {
-            await closeSubscription(node)
-            node.monitoredItems = {};
-            node.status({fill:"green",shape:"dot",text:"connected"});
-        }
+        // Clear intent even if initialization never produced a subscription.
+        node.monitoredItems = {};
+        await closeSubscription(node);
+        if (!node.closing && node.session) node.status({fill:"green",shape:"dot",text:"connected"});
         return;
     }
+    const revision = node.monitoringRevision;
 
     if (!msg.payload || typeof msg.payload !== 'object') {
         node.error(`Invalid input ${JSON.stringify(msg.payload)}: payload should be an object with variable names as keys and OPC UA tags as values.`, msg);
@@ -699,13 +995,8 @@ async function handleSubscriptionAndEvents(node, msg) {
     }
 
     if (node.subscription) await closeSubscription(node);
-    try {
-        await initializeSubscription(node);
-    } catch (err) {
-        node.error("Error initializing subscription:", err);
-        return;
-    }
-    
+    const session = node.session;
+
     // Prepare read requests to check if event types exist
     const itemsToRead = Object.values(node.monitoredItems).map((nodeId) => ({
         nodeId: nodeId,
@@ -716,9 +1007,13 @@ async function handleSubscriptionAndEvents(node, msg) {
     try {
         dataValues = await node.session.read(itemsToRead);
     } catch (err) {
-        node.error("Error preprocessing event types:", err);
+        if (node.closing || revision !== node.monitoringRevision) return;
+        node.error(`Error preprocessing event types: ${err}`, msg);
+        checkSessionError(node, err);
         return;
     }
+
+    if (node.closing || session !== node.session || revision !== node.monitoringRevision) return;
 
     // Check if the nodes are of NodeClass ObjectType (event types)
     Object.keys(node.monitoredItems).forEach((key, index) => {
@@ -742,96 +1037,153 @@ async function handleSubscriptionAndEvents(node, msg) {
         return;
     }
 
-    if (node.mode === "subscribe") {
-        subscribeItems(node, node.monitoredItems)
+    if (node.mode === "alarm" && Object.keys(node.monitoredItems).length > 4) {
+        node.warn(`Subscribing to more than 4 events is not recommanded! Alternatively, you can split the load across multiple nodes.`)
     }
-    else if (node.mode === "alarm") {
-        // TODO: finetune the maximum amount of items
-        if (Object.keys(node.monitoredItems).length > 4) {
-            node.warn(`Subscribing to more than 4 events is not recommanded! Alternatively, you can split the load across multiple nodes.`)
-        }
-        subscribeEvents(node, node.monitoredItems)
-    }
+    await node.restoreMonitoring();
     // NOTE: Maybe we should return a msg.
 }
 
-async function subscribeItems(node, monitoredItems) {
-    const processedItems = preprocessItems(monitoredItems);
-    try {
-        const itemGroup = opcua.ClientMonitoredItemGroup.create(
-            node.subscription,
-            Object.values(processedItems),
-            node.monitoredItemsOptions,
-            opcua.TimestampsToReturn.Both
-        )
-
-        itemGroup.on("initialized", () => {
-            node.status({ fill: "green", shape: "dot", text: `${Object.keys(monitoredItems).length} items subscribed`});
-        })
-        itemGroup.on("err", (message) => node.error(`Item group error: ${message}`, {}));
-        itemGroup.on("changed", (_, dataValue, index) => {
-            
-            const key = Object.keys(monitoredItems)[index];
-            // NOTE: need to create a new message to avoid msgid conflict
-            // if I do not do that, 'key' is not attached correctly
-            msg = {
-                "payload": {
-                    [key]: {
-                        ...dataValue,
-                        dataType: opcua.DataType[dataValue.value.dataType],
-                        arrayType: opcua.VariantArrayType[dataValue.value.arrayType],
-                        value: dataValue.value.value,
-                        statusCode: dataValue.statusCode.value,
-                    }
-                }
-            }
-            // NOTE: should we return information about the session?
-            node.send(msg);
-        });
+function recordMonitoringResult(node, key, nodeId, statusCode) {
+    if (statusCode.isGood()) {
+        node.activeItems[key] = nodeId;
+        return;
     }
-    catch (error) {
-        node.error(error, {});
-        node.status({ fill: "red", shape: "dot", text: "error"});
+    const errorDetails = [{
+        variableName: key,
+        nodeId: nodeId,
+        errorDescription: statusCode.description
+    }];
+    node.error(`Failed to subscribe the following item/s:\n- ${key} [${nodeId}]: ${statusCode.description}`, {errorDetails});
+    if (!TEMPORARY_CAPACITY_ERROR.test(statusCode.toString())) delete node.monitoredItems[key];
+}
+
+// Creation returns an object before the server has accepted the request.
+// Keep the lifecycle queue occupied until initialization finishes or fails.
+async function waitForMonitoring(item, subscription) {
+    let initialized;
+    let failed;
+    let terminated;
+    try {
+        await withTimeout(new Promise((resolve, reject) => {
+            initialized = resolve;
+            failed = (error) => reject(error instanceof Error ? error : new Error(`${error}`));
+            terminated = () => reject(new Error("Subscription terminated during monitoring initialization"));
+            item.once("initialized", initialized);
+            item.on("err", failed);
+            subscription.once("terminated", terminated);
+        }), INITIALIZATION_TIMEOUT, "Monitored item creation");
+    } catch (error) {
+        if (/timed out|BadTimeout|BadRequestTimeout/i.test(`${error.message || error}`)) {
+            error.monitoredItemCreationTimedOut = true;
+        }
+        throw error;
+    } finally {
+        item.removeListener("initialized", initialized);
+        item.removeListener("err", failed);
+        subscription.removeListener("terminated", terminated);
     }
 }
 
-async function subscribeEvents(node, monitoredItems) {
+async function subscribeItems(node, monitoredItems) {
+    monitoredItems = { ...monitoredItems };
+    const subscription = node.subscription;
+    const revision = node.monitoringRevision;
+    const current = () => !node.closing && subscription === node.subscription && revision === node.monitoringRevision;
+    const processedItems = preprocessItems(monitoredItems);
+    const itemGroup = opcua.ClientMonitoredItemGroup.create(
+        subscription,
+        Object.values(processedItems),
+        node.monitoredItemsOptions,
+        opcua.TimestampsToReturn.Both
+    );
 
-    try {
-        for (const [key, value] of Object.entries(monitoredItems)) {
-            const eventTypeId = opcua.resolveNodeId(value);
-            const fields = await opcua.extractConditionFields(node.session, eventTypeId);
-            const eventFilter = opcua.constructEventFilter(fields, opcua.ofType(eventTypeId));
-
-            const itemGroup = opcua.ClientMonitoredItem.create(
-                node.subscription,
-                {
-                    // TODO: at some point this should be an input and not hardcoded
-                    nodeId: opcua.resolveNodeId("Server"),
-                    attributeId: opcua.AttributeIds.EventNotifier 
-                },
-                {...node.monitoredItemsOptions, filter: eventFilter},
-                opcua.TimestampsToReturn.Both
-            )
-
-            itemGroup.on("initialized", async () => {
-                // NOTE: I'm not sure this is needed
-                await opcua.callConditionRefresh(node.session, node.subscription.subscriptionId);
-            })
-            itemGroup.on("err", (message) => node.error(`Event group error: ${message}`, {}));
-            itemGroup.on("changed", (dataValue) => {
-                msg = {
-                    "payload": {
-                        [key]: opcua.fieldsToJson(fields, dataValue, false)
-                    }
+    itemGroup.on("changed", (_, dataValue, index) => {
+        if (!current()) return;
+        const key = Object.keys(monitoredItems)[index];
+        // Each notification needs its own message for Node-RED message tracking.
+        const msg = {
+            "payload": {
+                [key]: {
+                    ...dataValue,
+                    dataType: opcua.DataType[dataValue.value.dataType],
+                    arrayType: opcua.VariantArrayType[dataValue.value.arrayType],
+                    value: dataValue.value.value,
+                    statusCode: dataValue.statusCode.value,
                 }
-                // NOTE: should we return information about the session?
-                node.send(msg);
-            });
+            }
         }
-        node.status({ fill: "green", shape: "dot", text: `${Object.keys(node.monitoredItems).length} events subscribed`});
+        node.send(msg);
+    });
+    try {
+        await waitForMonitoring(itemGroup, subscription);
     } catch (error) {
-        node.error(error, {});
-        node.status({ fill: "red", shape: "dot", text: "error"});
+        if (current() && TEMPORARY_CAPACITY_ERROR.test(`${error.message || error}`)) {
+            // The SDK leaves the individual handles registered after a service rejection.
+            // Dispose of those handles without disturbing successful sibling groups.
+            for (const item of itemGroup.monitoredItems) {
+                try {
+                    await withTimeout(item.terminate(), CLOSE_TIMEOUT, "Rejected item close");
+                } catch (closeError) {
+                    node.debug("Error closing rejected item (ignored): " + closeError);
+                }
+            }
+        }
+        throw error;
+    }
+    if (!current()) return;
+    Object.entries(monitoredItems).forEach(([key, nodeId], index) => {
+        recordMonitoringResult(node, key, nodeId, itemGroup.monitoredItems[index].statusCode);
+    });
+}
+
+async function subscribeEvents(node, monitoredItems) {
+    monitoredItems = { ...monitoredItems };
+    const subscription = node.subscription;
+    const session = node.session;
+    const revision = node.monitoringRevision;
+    const current = () => !node.closing && subscription === node.subscription && revision === node.monitoringRevision;
+
+    for (const [key, value] of Object.entries(monitoredItems)) {
+        const eventTypeId = opcua.resolveNodeId(value);
+        const fields = await opcua.extractConditionFields(session, eventTypeId);
+        if (!current()) return;
+        const eventFilter = opcua.constructEventFilter(fields, opcua.ofType(eventTypeId));
+        const item = opcua.ClientMonitoredItem.create(
+            subscription,
+            {
+                // TODO: at some point this should be an input and not hardcoded
+                nodeId: opcua.resolveNodeId("Server"),
+                attributeId: opcua.AttributeIds.EventNotifier
+            },
+            {...node.monitoredItemsOptions, filter: eventFilter},
+            opcua.TimestampsToReturn.Both
+        );
+
+        item.on("changed", (dataValue) => {
+            if (!current()) return;
+            const msg = {
+                "payload": {
+                    [key]: opcua.fieldsToJson(fields, dataValue, false)
+                }
+            }
+            node.send(msg);
+        });
+        try {
+            await waitForMonitoring(item, subscription);
+        } catch (error) {
+            if (!current()) return;
+            // Per-item results have a status code; service failures must reach recovery.
+            if (!item.statusCode || item.statusCode === opcua.StatusCodes.BadDataUnavailable) throw error;
+            recordMonitoringResult(node, key, value, item.statusCode);
+            continue;
+        }
+        if (!current()) return;
+        node.activeItems[key] = value;
+        try {
+            await opcua.callConditionRefresh(session, subscription.subscriptionId);
+        } catch (error) {
+            if (current()) node.debug(`Condition refresh failed: ${error}`);
+        }
     }
 }

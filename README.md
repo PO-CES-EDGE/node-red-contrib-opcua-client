@@ -6,7 +6,9 @@ A simple Node-RED module for interacting with OPC UA (Open Platform Communicatio
 
 ## Features
 * User-friendly interface
-* Automatic reconnection on network or server failures
+* Automatic reconnection on network or server failures, with continuous retries and recovery when connection progress stalls
+* Automatic session and subscription recovery without interrupting healthy nodes sharing the connection
+* Manual reconnection from a flow using `msg.reconnect = true`
 * Single node supporting multiple functionalities
 * Reuse the same OPC UA connection across multiple nodes
 * Support multiple OPC UA servers
