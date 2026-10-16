@@ -517,13 +517,13 @@ module.exports = function(RED) {
                 node.endpoint.recover("requested by msg.reconnect");
                 return;
             }
-            if ((node.mode === "subscribe" || node.mode === "alarm") && msg.hasOwnProperty("reset") && node.session) {
+            if ((node.mode === "subscribe" || node.mode === "alarm") && msg.hasOwnProperty("reset")) {
                 node.monitoringRevision++;
                 node.monitoredItems = {};
                 await serialize(() => handleSubscriptionAndEvents(node, msg));
                 return;
             }
-            if (!node.session) {
+            if (!node.session || node.endpoint.state !== CONNECTED) {
                 node.error("Impossible to execute operation, client is not connected to the OPC UA server.", msg)
                 // The endpoint is connected but this node lost its session: try to get a new one
                 if (node.endpoint.state === CONNECTED) {
