@@ -500,6 +500,8 @@ module.exports = function(RED) {
                 node.error(`Error initializing subscription: ${error}`, {});
                 node.status({ fill: "red", shape: "dot", text: "error" });
                 checkSessionError(node, error);
+                // A rejected whole request has no usable monitoring to preserve.
+                if (TEMPORARY_CAPACITY_ERROR.test(`${error.message || error}`)) await closeSubscription(node);
                 node.scheduleRetry(error);
             }
         };
@@ -592,7 +594,11 @@ module.exports = function(RED) {
                 case "subscribe":
                 case "alarm":
                 {
-                    await serialize(() => handleSubscriptionAndEvents(node, msg))
+                    const revision = node.monitoringRevision;
+                    await serialize(() => {
+                        if (revision !== node.monitoringRevision) return;
+                        return handleSubscriptionAndEvents(node, msg);
+                    });
                     break;
                 }
                 case "browse": {
@@ -979,96 +985,101 @@ async function handleSubscriptionAndEvents(node, msg) {
     // NOTE: Maybe we should return a msg.
 }
 
+// Creation returns an object before the server has accepted the request.
+// Keep the lifecycle queue occupied until initialization finishes or fails.
+async function waitForMonitoring(item, subscription) {
+    let initialized;
+    let failed;
+    let terminated;
+    try {
+        await withTimeout(new Promise((resolve, reject) => {
+            initialized = resolve;
+            failed = (error) => reject(error instanceof Error ? error : new Error(`${error}`));
+            terminated = () => reject(new Error("Subscription terminated during monitoring initialization"));
+            item.once("initialized", initialized);
+            item.on("err", failed);
+            subscription.once("terminated", terminated);
+        }), 20000, "Monitored item creation");
+    } finally {
+        item.removeListener("initialized", initialized);
+        item.removeListener("err", failed);
+        subscription.removeListener("terminated", terminated);
+    }
+}
+
 async function subscribeItems(node, monitoredItems) {
     monitoredItems = { ...monitoredItems };
     const subscription = node.subscription;
     const revision = node.monitoringRevision;
     const current = () => !node.closing && subscription === node.subscription && revision === node.monitoringRevision;
     const processedItems = preprocessItems(monitoredItems);
-    try {
-        const itemGroup = opcua.ClientMonitoredItemGroup.create(
-            node.subscription,
-            Object.values(processedItems),
-            node.monitoredItemsOptions,
-            opcua.TimestampsToReturn.Both
-        )
+    const itemGroup = opcua.ClientMonitoredItemGroup.create(
+        subscription,
+        Object.values(processedItems),
+        node.monitoredItemsOptions,
+        opcua.TimestampsToReturn.Both
+    );
 
-        itemGroup.on("initialized", () => {
-            if (!current()) return;
-            node.status({ fill: "green", shape: "dot", text: `${Object.keys(monitoredItems).length} items subscribed`});
-        })
-        itemGroup.on("err", (message) => { if (current()) node.error(`Item group error: ${message}`, {}); });
-        itemGroup.on("changed", (_, dataValue, index) => {
-            if (!current()) return;
-            
-            const key = Object.keys(monitoredItems)[index];
-            // NOTE: need to create a new message to avoid msgid conflict
-            // if I do not do that, 'key' is not attached correctly
-            const msg = {
-                "payload": {
-                    [key]: {
-                        ...dataValue,
-                        dataType: opcua.DataType[dataValue.value.dataType],
-                        arrayType: opcua.VariantArrayType[dataValue.value.arrayType],
-                        value: dataValue.value.value,
-                        statusCode: dataValue.statusCode.value,
-                    }
+    itemGroup.on("changed", (_, dataValue, index) => {
+        if (!current()) return;
+        const key = Object.keys(monitoredItems)[index];
+        // Each notification needs its own message for Node-RED message tracking.
+        const msg = {
+            "payload": {
+                [key]: {
+                    ...dataValue,
+                    dataType: opcua.DataType[dataValue.value.dataType],
+                    arrayType: opcua.VariantArrayType[dataValue.value.arrayType],
+                    value: dataValue.value.value,
+                    statusCode: dataValue.statusCode.value,
                 }
             }
-            // NOTE: should we return information about the session?
-            node.send(msg);
-        });
-    }
-    catch (error) {
-        node.error(error, {});
-        node.status({ fill: "red", shape: "dot", text: "error"});
-    }
+        }
+        node.send(msg);
+    });
+    await waitForMonitoring(itemGroup, subscription);
+    if (current()) node.status({ fill: "green", shape: "dot", text: `${Object.keys(monitoredItems).length} items subscribed`});
 }
 
 async function subscribeEvents(node, monitoredItems) {
     monitoredItems = { ...monitoredItems };
     const subscription = node.subscription;
+    const session = node.session;
     const revision = node.monitoringRevision;
     const current = () => !node.closing && subscription === node.subscription && revision === node.monitoringRevision;
 
-    try {
-        for (const [key, value] of Object.entries(monitoredItems)) {
-            const eventTypeId = opcua.resolveNodeId(value);
-            const fields = await opcua.extractConditionFields(node.session, eventTypeId);
+    for (const [key, value] of Object.entries(monitoredItems)) {
+        const eventTypeId = opcua.resolveNodeId(value);
+        const fields = await opcua.extractConditionFields(session, eventTypeId);
+        if (!current()) return;
+        const eventFilter = opcua.constructEventFilter(fields, opcua.ofType(eventTypeId));
+        const item = opcua.ClientMonitoredItem.create(
+            subscription,
+            {
+                // TODO: at some point this should be an input and not hardcoded
+                nodeId: opcua.resolveNodeId("Server"),
+                attributeId: opcua.AttributeIds.EventNotifier
+            },
+            {...node.monitoredItemsOptions, filter: eventFilter},
+            opcua.TimestampsToReturn.Both
+        );
+
+        item.on("changed", (dataValue) => {
             if (!current()) return;
-            const eventFilter = opcua.constructEventFilter(fields, opcua.ofType(eventTypeId));
-
-            const itemGroup = opcua.ClientMonitoredItem.create(
-                node.subscription,
-                {
-                    // TODO: at some point this should be an input and not hardcoded
-                    nodeId: opcua.resolveNodeId("Server"),
-                    attributeId: opcua.AttributeIds.EventNotifier 
-                },
-                {...node.monitoredItemsOptions, filter: eventFilter},
-                opcua.TimestampsToReturn.Both
-            )
-
-            itemGroup.on("initialized", async () => {
-                if (!current()) return;
-                // NOTE: I'm not sure this is needed
-                await opcua.callConditionRefresh(node.session, node.subscription.subscriptionId);
-            })
-            itemGroup.on("err", (message) => { if (current()) node.error(`Event group error: ${message}`, {}); });
-            itemGroup.on("changed", (dataValue) => {
-                if (!current()) return;
-                const msg = {
-                    "payload": {
-                        [key]: opcua.fieldsToJson(fields, dataValue, false)
-                    }
+            const msg = {
+                "payload": {
+                    [key]: opcua.fieldsToJson(fields, dataValue, false)
                 }
-                // NOTE: should we return information about the session?
-                node.send(msg);
-            });
+            }
+            node.send(msg);
+        });
+        await waitForMonitoring(item, subscription);
+        if (!current()) return;
+        try {
+            await opcua.callConditionRefresh(session, subscription.subscriptionId);
+        } catch (error) {
+            if (current()) node.debug(`Condition refresh failed: ${error}`);
         }
-        if (current()) node.status({ fill: "green", shape: "dot", text: `${Object.keys(node.monitoredItems).length} events subscribed`});
-    } catch (error) {
-        node.error(error, {});
-        node.status({ fill: "red", shape: "dot", text: "error"});
     }
+    if (current()) node.status({ fill: "green", shape: "dot", text: `${Object.keys(monitoredItems).length} events subscribed`});
 }
