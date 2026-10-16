@@ -185,6 +185,7 @@ async function initializeSubscription(node) {
     node.debug("Subscription created");
 
     node.subscription = subscription;
+    subscription.on("terminated", () => node.recoverSubscription(subscription));
 }
 
 async function closeSubscription(node) {
@@ -518,6 +519,19 @@ module.exports = function(RED) {
                 checkSessionError(node, error);
                 node.scheduleRetry(error);
             }
+        };
+
+        node.recoverSubscription = (subscription) => {
+            if (node.closing || subscription !== node.subscription) return;
+            // Clear ownership before queuing recovery so obsolete callbacks are ignored.
+            node.subscription = null;
+            node.activeItems = {};
+            node.cancelRetry();
+            const revision = node.monitoringRevision;
+            serialize(async () => {
+                if (node.closing || revision !== node.monitoringRevision) return;
+                await node.restoreMonitoring();
+            });
         };
 
         // Recreate the session if 'session' is still the current one
