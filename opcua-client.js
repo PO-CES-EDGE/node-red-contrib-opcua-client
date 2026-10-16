@@ -444,6 +444,7 @@ module.exports = function(RED) {
                 serialize(async () => {
                     if (node.closing || revision !== node.monitoringRevision || node.endpoint.state !== CONNECTED) return;
                     if (!node.session) await setupSession();
+                    else await node.restoreMonitoring();
                 });
             }, node.retryDelay);
             node.retryDelay = Math.min(node.retryDelay * 2, 10000);
@@ -463,20 +464,8 @@ module.exports = function(RED) {
                 if (node.closing || !node.session) return;
                 node.cancelRetry();
 
-                if (node.mode === "subscribe") {
-                    if (!isObjectEmpty(node.monitoredItems)) {
-                        await initializeSubscription(node);
-                        if (node.subscription) await subscribeItems(node, node.monitoredItems);
-                    } else {
-                        node.status({fill:"green",shape:"dot",text:"connected"});
-                    }
-                } else if (node.mode === "alarm") {
-                    if (!isObjectEmpty(node.monitoredItems)) {
-                        await initializeSubscription(node);
-                        if (node.subscription) await subscribeEvents(node, node.monitoredItems);
-                    } else {
-                        node.status({fill:"green",shape:"dot",text:"connected"});
-                    }
+                if (node.mode === "subscribe" || node.mode === "alarm") {
+                    await node.restoreMonitoring();
                 } else {
                     node.status({fill:"green",shape:"dot",text:"connected"});
                 }
@@ -486,6 +475,32 @@ module.exports = function(RED) {
                 node.scheduleRetry(error);
                 node.error(`Error initializing OPC UA session: ${error}`);
                 node.status({ fill: "red", shape: "dot", text: "error" });
+            }
+        };
+
+        node.restoreMonitoring = async () => {
+            if (node.closing || !node.session || node.endpoint.state !== CONNECTED) return;
+            const revision = node.monitoringRevision;
+            if (isObjectEmpty(node.monitoredItems)) {
+                node.cancelRetry();
+                node.status({fill:"green",shape:"dot",text:"connected"});
+                return;
+            }
+            try {
+                if (!node.subscription) await initializeSubscription(node);
+                if (node.closing || !node.subscription || revision !== node.monitoringRevision) return;
+                if (node.mode === "subscribe") {
+                    await subscribeItems(node, node.monitoredItems);
+                } else {
+                    await subscribeEvents(node, node.monitoredItems);
+                }
+                if (!node.closing && revision === node.monitoringRevision) node.cancelRetry();
+            } catch (error) {
+                if (node.closing || revision !== node.monitoringRevision) return;
+                node.error(`Error initializing subscription: ${error}`, {});
+                node.status({ fill: "red", shape: "dot", text: "error" });
+                checkSessionError(node, error);
+                node.scheduleRetry(error);
             }
         };
 
@@ -915,17 +930,7 @@ async function handleSubscriptionAndEvents(node, msg) {
     }
 
     if (node.subscription) await closeSubscription(node);
-    try {
-        await initializeSubscription(node);
-    } catch (err) {
-        if (node.closing || revision !== node.monitoringRevision) return;
-        node.error(`Error initializing subscription: ${err}`, msg);
-        checkSessionError(node, err);
-        return;
-    }
-    
-    if (!node.subscription || node.closing || revision !== node.monitoringRevision) return;
-    const subscription = node.subscription;
+    const session = node.session;
 
     // Prepare read requests to check if event types exist
     const itemsToRead = Object.values(node.monitoredItems).map((nodeId) => ({
@@ -943,7 +948,7 @@ async function handleSubscriptionAndEvents(node, msg) {
         return;
     }
 
-    if (node.closing || subscription !== node.subscription || revision !== node.monitoringRevision) return;
+    if (node.closing || session !== node.session || revision !== node.monitoringRevision) return;
 
     // Check if the nodes are of NodeClass ObjectType (event types)
     Object.keys(node.monitoredItems).forEach((key, index) => {
@@ -967,16 +972,10 @@ async function handleSubscriptionAndEvents(node, msg) {
         return;
     }
 
-    if (node.mode === "subscribe") {
-        await subscribeItems(node, node.monitoredItems)
+    if (node.mode === "alarm" && Object.keys(node.monitoredItems).length > 4) {
+        node.warn(`Subscribing to more than 4 events is not recommanded! Alternatively, you can split the load across multiple nodes.`)
     }
-    else if (node.mode === "alarm") {
-        // TODO: finetune the maximum amount of items
-        if (Object.keys(node.monitoredItems).length > 4) {
-            node.warn(`Subscribing to more than 4 events is not recommanded! Alternatively, you can split the load across multiple nodes.`)
-        }
-        await subscribeEvents(node, node.monitoredItems)
-    }
+    await node.restoreMonitoring();
     // NOTE: Maybe we should return a msg.
 }
 
