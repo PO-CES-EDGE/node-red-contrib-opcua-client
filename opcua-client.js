@@ -42,16 +42,11 @@ const options = {
     automaticallyAcceptUnknownCertificate: true
 }
 
-// SELF-RECOVERY
-// node-opcua retries the connection on its own, but it can give up (e.g. a non-network error) or hang
-// in its reconnection loop. The endpoint watchdog recreates the whole client in those cases,
-// which is what a flow restart used to do.
-const RECOVERY_CHECK_INTERVAL = 5000;    // how often the watchdog checks the connection
-const RECOVERY_NO_PROGRESS = 30000;      // reconnecting without any attempt for this long -> recreate the client
-const RECOVERY_MIN_DELAY = 10000;        // minimum time between two client recreations...
-const RECOVERY_MAX_DELAY = 60000;        // ...doubling after each one, up to this limit
-const CLOSE_TIMEOUT = 5000;              // do not wait forever for a dead server to acknowledge a close
-const MAX_TIMED_OUT_REQUESTS = 3;        // consecutive timeouts before the connection is considered dead
+// Let node-opcua handle normal retries. Recreate a disconnected client only
+// when its connection/reconnection attempts have stopped making progress.
+const RECOVERY_CHECK_INTERVAL = 5000;
+const RECOVERY_NO_PROGRESS = 60000;
+const CLOSE_TIMEOUT = 5000; // bound cleanup when a server does not acknowledge close
 
 // Errors meaning the session is unusable, even though the endpoint may still look connected
 const SESSION_LOST_ERROR = /BadSession|BadSecureChannel|BadConnectionClosed|BadNotConnected|BadServerNotConnected|session.*(closed|invalid)|not connected/i;
@@ -104,6 +99,7 @@ async function initializeClient(node, client, endpointUrl) {
     } catch (error) {
         if (client !== node.client) return;
         node.state = ERROR;
+        node.lastProgress = Date.now();
         // NOTE: no need to throw any error. The error is already propagated using the 'connection_failed' event.
         // The watchdog will recreate the client and try again.
     }
@@ -135,7 +131,6 @@ async function initializeSession(node) {
     session.on("keepalive", () => {
         if (session !== node.session) return;
         node.debug(`keepalive ${node.name}`);
-        node.endpoint.reportHealthy();
     });
     session.on("keepalive_failure", () => {
         node.debug(`keepalive_failure ${node.name}: ${node.endpoint.state}`);
@@ -225,20 +220,17 @@ module.exports = function(RED) {
         this.client = null;
         this.closing = false;
         this.recycling = false;
-        this.pendingRecovery = null;
-        this.lastRecovery = 0;
-        this.recoveryDelay = RECOVERY_MIN_DELAY;
         this.lastProgress = Date.now();
-        this.timedOutRequests = 0;
 
         const onConnect = () => {
             this.state = CONNECTED;
-            this.timedOutRequests = 0;
+            this.lastProgress = Date.now();
             this.emit("CONNECTED");
             this.debug("connected");
         }
         const onConnectFail = (error) => {
             this.state = ERROR;
+            this.lastProgress = Date.now();
             this.emit("ERROR", error);
             this.debug("connection_failed");
         }
@@ -263,20 +255,14 @@ module.exports = function(RED) {
         }
         const onConnectionReestablished = () => {
             this.state = CONNECTED;
-            this.timedOutRequests = 0;
+            this.lastProgress = Date.now();
             this.emit("CONNECTED");
             this.debug("connection_reestablished");
         }
         const onTimeoutRequest = (request) => {
-            // NOTE: a single slow request does not mean the connection is lost, so the sessions are kept.
-            // Several timeouts in a row usually mean a half-open connection (e.g. the PLC lost power).
-            this.timedOutRequests++;
             const requestName = request && request.constructor ? request.constructor.name : `${request}`;
-            this.warn(`${requestName} timed out (${this.timedOutRequests} in a row)`);
+            this.warn(`${requestName} timed out`);
             this.debug("timed_out_request");
-            if (this.timedOutRequests >= MAX_TIMED_OUT_REQUESTS) {
-                this.recover(`${this.timedOutRequests} requests timed out in a row`);
-            }
         }
 
         const createClient = () => {
@@ -309,14 +295,11 @@ module.exports = function(RED) {
         // Same as a flow restart: throw the client away and connect with a new one
         const recycleClient = async (reason) => {
             this.recycling = true;
-            this.pendingRecovery = null;
-            this.lastRecovery = Date.now();
             this.warn(`Recreating OPC UA client for ${this.endpoint}: ${reason}`);
 
             const oldClient = this.client;
             this.client = null;
             this.state = CONNECTING;
-            this.timedOutRequests = 0;
             // Sessions belong to the old client, the client nodes must drop them
             this.emit("RESET");
             this.emit("CONNECTING");
@@ -332,41 +315,20 @@ module.exports = function(RED) {
             await initializeClient(this, this.client, this.endpoint);
         }
 
+        // Manual recovery is explicit; individual request/session failures
+        // must not recycle the connection shared by otherwise healthy nodes.
+        this.recover = (reason) => {
+            if (this.closing || this.recycling) return;
+            recycleClient(reason).catch((error) => this.error(`Client recovery failed: ${error}`));
+        };
+
         const watchdog = () => {
-            if (this.closing || this.recycling) return;
-            const now = Date.now();
-
-            if (this.pendingRecovery) {
-                // already requested
-            } else if (this.state === ERROR) {
-                // node-opcua gave up connecting
-                this.pendingRecovery = "connection failed";
-            } else if (this.state !== CONNECTED && now - this.lastProgress >= RECOVERY_NO_PROGRESS) {
-                // node-opcua says it is reconnecting, but nothing has happened for a while
-                this.pendingRecovery = `no reconnection attempt for ${Math.round((now - this.lastProgress) / 1000)}s`;
+            if (this.closing || this.recycling || this.state === CONNECTED) return;
+            const stalledFor = Date.now() - this.lastProgress;
+            if (stalledFor >= RECOVERY_NO_PROGRESS) {
+                this.recover(`no connection progress for ${Math.round(stalledFor / 1000)}s`);
             }
-
-            if (this.pendingRecovery && now - this.lastRecovery >= this.recoveryDelay) {
-                // Back off while the server stays unreachable, reset once a connection has been established
-                this.recoveryDelay = this.state === CONNECTED
-                    ? RECOVERY_MIN_DELAY
-                    : Math.min(this.recoveryDelay * 2, RECOVERY_MAX_DELAY);
-                recycleClient(this.pendingRecovery).catch((error) => this.error(`Client recovery failed: ${error}`));
-            }
-        }
-
-        // Ask for the client to be recreated. Requests are rate limited by the watchdog backoff,
-        // unless 'force' is set (manual request from a flow)
-        this.recover = (reason, force = false) => {
-            if (this.closing || this.recycling) return;
-            this.pendingRecovery = this.pendingRecovery || reason;
-            if (force) this.lastRecovery = 0;
-            watchdog();
-        }
-
-        this.reportHealthy = () => {
-            this.timedOutRequests = 0;
-        }
+        };
 
         this.state = CONNECTING
         this.emit("CONNECTING");
@@ -473,8 +435,6 @@ module.exports = function(RED) {
             catch (error) {
                 node.error(`Error initializing OPC UA session: ${error}`);
                 node.status({ fill: "red", shape: "dot", text: "error" });
-                // A connected client that cannot create a session is broken: recreate it
-                node.endpoint.recover(`session initialization failed: ${error.message || error}`);
             }
         };
 
@@ -528,7 +488,7 @@ module.exports = function(RED) {
         node.on("input", async (msg) => {
             // Manual recovery from a flow: recreate the OPC UA client, like a flow restart
             if (msg.reconnect) {
-                node.endpoint.recover("requested by msg.reconnect", true);
+                node.endpoint.recover("requested by msg.reconnect");
                 return;
             }
             if (!node.session) {
