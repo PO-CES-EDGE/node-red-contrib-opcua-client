@@ -190,6 +190,7 @@ async function initializeSubscription(node) {
 async function closeSubscription(node) {
     const subscription = node.subscription;
     node.subscription = null;
+    node.activeItems = {};
     if (!subscription) return;
     try {
         await withTimeout(subscription.terminate(), CLOSE_TIMEOUT, "Subscription close");
@@ -409,6 +410,7 @@ module.exports = function(RED) {
         };
 
         node.monitoredItems = {};
+        node.activeItems = {};
         node.monitoringRevision = 0;
 
         // BROWSE
@@ -489,19 +491,31 @@ module.exports = function(RED) {
             try {
                 if (!node.subscription) await initializeSubscription(node);
                 if (node.closing || !node.subscription || revision !== node.monitoringRevision) return;
-                if (node.mode === "subscribe") {
-                    await subscribeItems(node, node.monitoredItems);
-                } else {
-                    await subscribeEvents(node, node.monitoredItems);
+                const pendingItems = {};
+                for (const [key, value] of Object.entries(node.monitoredItems)) {
+                    if (!node.activeItems.hasOwnProperty(key)) pendingItems[key] = value;
                 }
-                if (!node.closing && revision === node.monitoringRevision) node.cancelRetry();
+                if (!isObjectEmpty(pendingItems)) {
+                    if (node.mode === "subscribe") {
+                        await subscribeItems(node, pendingItems);
+                    } else {
+                        await subscribeEvents(node, pendingItems);
+                    }
+                }
+                if (node.closing || revision !== node.monitoringRevision) return;
+                if (Object.keys(node.activeItems).length < Object.keys(node.monitoredItems).length) {
+                    node.scheduleRetry(new Error("BadTooManyMonitoredItems"));
+                } else {
+                    node.cancelRetry();
+                }
+                const count = Object.keys(node.activeItems).length;
+                const kind = node.mode === "alarm" ? "events" : "items";
+                node.status({ fill: "green", shape: "dot", text: `${count} ${kind} subscribed`});
             } catch (error) {
                 if (node.closing || revision !== node.monitoringRevision) return;
                 node.error(`Error initializing subscription: ${error}`, {});
                 node.status({ fill: "red", shape: "dot", text: "error" });
                 checkSessionError(node, error);
-                // A rejected whole request has no usable monitoring to preserve.
-                if (TEMPORARY_CAPACITY_ERROR.test(`${error.message || error}`)) await closeSubscription(node);
                 node.scheduleRetry(error);
             }
         };
@@ -541,6 +555,7 @@ module.exports = function(RED) {
             node.cancelRetry();
             return serialize(async () => {
                 node.subscription = null;
+                node.activeItems = {};
                 node.session = null;
             });
         };
@@ -985,6 +1000,20 @@ async function handleSubscriptionAndEvents(node, msg) {
     // NOTE: Maybe we should return a msg.
 }
 
+function recordMonitoringResult(node, key, nodeId, statusCode) {
+    if (statusCode.isGood()) {
+        node.activeItems[key] = nodeId;
+        return;
+    }
+    const errorDetails = [{
+        variableName: key,
+        nodeId: nodeId,
+        errorDescription: statusCode.description
+    }];
+    node.error(`Failed to subscribe the following item/s:\n- ${key} [${nodeId}]: ${statusCode.description}`, {errorDetails});
+    if (!TEMPORARY_CAPACITY_ERROR.test(statusCode.toString())) delete node.monitoredItems[key];
+}
+
 // Creation returns an object before the server has accepted the request.
 // Keep the lifecycle queue occupied until initialization finishes or fails.
 async function waitForMonitoring(item, subscription) {
@@ -1037,8 +1066,26 @@ async function subscribeItems(node, monitoredItems) {
         }
         node.send(msg);
     });
-    await waitForMonitoring(itemGroup, subscription);
-    if (current()) node.status({ fill: "green", shape: "dot", text: `${Object.keys(monitoredItems).length} items subscribed`});
+    try {
+        await waitForMonitoring(itemGroup, subscription);
+    } catch (error) {
+        if (current() && TEMPORARY_CAPACITY_ERROR.test(`${error.message || error}`)) {
+            // The SDK leaves the individual handles registered after a service rejection.
+            // Dispose of those handles without disturbing successful sibling groups.
+            for (const item of itemGroup.monitoredItems) {
+                try {
+                    await withTimeout(item.terminate(), CLOSE_TIMEOUT, "Rejected item close");
+                } catch (closeError) {
+                    node.debug("Error closing rejected item (ignored): " + closeError);
+                }
+            }
+        }
+        throw error;
+    }
+    if (!current()) return;
+    Object.entries(monitoredItems).forEach(([key, nodeId], index) => {
+        recordMonitoringResult(node, key, nodeId, itemGroup.monitoredItems[index].statusCode);
+    });
 }
 
 async function subscribeEvents(node, monitoredItems) {
@@ -1073,13 +1120,21 @@ async function subscribeEvents(node, monitoredItems) {
             }
             node.send(msg);
         });
-        await waitForMonitoring(item, subscription);
+        try {
+            await waitForMonitoring(item, subscription);
+        } catch (error) {
+            if (!current()) return;
+            // Per-item results have a status code; service failures must reach recovery.
+            if (!item.statusCode || item.statusCode === opcua.StatusCodes.BadDataUnavailable) throw error;
+            recordMonitoringResult(node, key, value, item.statusCode);
+            continue;
+        }
         if (!current()) return;
+        node.activeItems[key] = value;
         try {
             await opcua.callConditionRefresh(session, subscription.subscriptionId);
         } catch (error) {
             if (current()) node.debug(`Condition refresh failed: ${error}`);
         }
     }
-    if (current()) node.status({ fill: "green", shape: "dot", text: `${Object.keys(monitoredItems).length} events subscribed`});
 }
