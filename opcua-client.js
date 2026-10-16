@@ -538,6 +538,12 @@ module.exports = function(RED) {
                     await closeSession(node);
                     if (node.closing || revision !== node.monitoringRevision) return;
                     node.scheduleRetry(new Error("BadResourceUnavailable"));
+                } else if (error.monitoredItemCreationTimedOut) {
+                    // A timed-out create may still allocate items. Delete their subscription
+                    // before retrying so late completion cannot leave duplicate monitoring.
+                    await closeSubscription(node);
+                    if (node.closing || revision !== node.monitoringRevision) return;
+                    node.scheduleRetry(new Error("BadResourceUnavailable"));
                 } else {
                     checkSessionError(node, error);
                     node.scheduleRetry(error);
@@ -1066,7 +1072,12 @@ async function waitForMonitoring(item, subscription) {
             item.once("initialized", initialized);
             item.on("err", failed);
             subscription.once("terminated", terminated);
-        }), 20000, "Monitored item creation");
+        }), INITIALIZATION_TIMEOUT, "Monitored item creation");
+    } catch (error) {
+        if (/timed out|BadTimeout|BadRequestTimeout/i.test(`${error.message || error}`)) {
+            error.monitoredItemCreationTimedOut = true;
+        }
+        throw error;
     } finally {
         item.removeListener("initialized", initialized);
         item.removeListener("err", failed);
