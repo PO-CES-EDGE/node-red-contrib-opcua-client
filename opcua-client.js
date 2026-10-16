@@ -48,6 +48,9 @@ const RECOVERY_CHECK_INTERVAL = 5000;
 const RECOVERY_NO_PROGRESS = 60000;
 const CLOSE_TIMEOUT = 5000; // bound cleanup when a server does not acknowledge close
 
+// Temporary server capacity failures can be retried without replacing the shared client.
+const TEMPORARY_CAPACITY_ERROR = /BadTooManySessions|BadTooManySubscriptions|BadTooManyMonitoredItems|BadResourceUnavailable|BadServerTooBusy|BadOutOfMemory|BadTcpNotEnoughResources/;
+
 // Errors meaning the session is unusable, even though the endpoint may still look connected
 const SESSION_LOST_ERROR = /BadSession|BadSecureChannel|BadConnectionClosed|BadNotConnected|BadServerNotConnected|session.*(closed|invalid)|not connected/i;
 
@@ -425,6 +428,27 @@ module.exports = function(RED) {
             return node.lifecycle;
         };
 
+        node.retryTimer = null;
+        node.retryDelay = 1000;
+        node.cancelRetry = () => {
+            clearTimeout(node.retryTimer);
+            node.retryTimer = null;
+            node.retryDelay = 1000;
+        };
+        node.scheduleRetry = (error) => {
+            if (!TEMPORARY_CAPACITY_ERROR.test(`${error.message || error}`)) return;
+            if (node.closing || node.retryTimer || node.endpoint.state !== CONNECTED) return;
+            const revision = node.monitoringRevision;
+            node.retryTimer = setTimeout(() => {
+                node.retryTimer = null;
+                serialize(async () => {
+                    if (node.closing || revision !== node.monitoringRevision || node.endpoint.state !== CONNECTED) return;
+                    if (!node.session) await setupSession();
+                });
+            }, node.retryDelay);
+            node.retryDelay = Math.min(node.retryDelay * 2, 10000);
+        };
+
         // NOTE: clean previous sessions and subscription if needed and create new one
         // If this is called after a reconnection, we cannot guarantee that sessions and subscriptions are still valid.
         // Just in case, we recreate everything
@@ -437,6 +461,7 @@ module.exports = function(RED) {
             try {
                 await initializeSession(node);
                 if (node.closing || !node.session) return;
+                node.cancelRetry();
 
                 if (node.mode === "subscribe") {
                     if (!isObjectEmpty(node.monitoredItems)) {
@@ -458,6 +483,7 @@ module.exports = function(RED) {
             }
             catch (error) {
                 if (node.closing) return;
+                node.scheduleRetry(error);
                 node.error(`Error initializing OPC UA session: ${error}`);
                 node.status({ fill: "red", shape: "dot", text: "error" });
             }
@@ -474,6 +500,8 @@ module.exports = function(RED) {
         };
 
         const onConnecting = (count) => {
+            node.cancelRetry();
+            if (node.closing) return;
             if (count) {
                 node.status({ fill: "yellow", shape: "dot", text: `connecting: attempt #${count}`});
             } else {
@@ -481,17 +509,24 @@ module.exports = function(RED) {
             }
         };
         const onConnected = () => serialize(setupSession);
-        const onError = (err) => serialize(async () => {
-            if (node.subscription) await closeSubscription(node);
-            if (node.session) await closeSession(node);
-            node.error(`ERROR: ${err.message}`, {});
-            node.status({ fill: "red", shape: "dot", text: "error" });
-        });
+        const onError = (err) => {
+            node.cancelRetry();
+            return serialize(async () => {
+                if (node.closing) return;
+                if (node.subscription) await closeSubscription(node);
+                if (node.session) await closeSession(node);
+                node.error(`ERROR: ${err.message}`, {});
+                node.status({ fill: "red", shape: "dot", text: "error" });
+            });
+        };
         // The client is being recreated: its sessions are closed with it
-        const onReset = () => serialize(async () => {
-            node.subscription = null;
-            node.session = null;
-        });
+        const onReset = () => {
+            node.cancelRetry();
+            return serialize(async () => {
+                node.subscription = null;
+                node.session = null;
+            });
+        };
 
         node.endpoint.on("CONNECTING", onConnecting);
         node.endpoint.on("CONNECTED", onConnected);
@@ -519,6 +554,7 @@ module.exports = function(RED) {
             }
             if ((node.mode === "subscribe" || node.mode === "alarm") && msg.hasOwnProperty("reset")) {
                 node.monitoringRevision++;
+                node.cancelRetry();
                 node.monitoredItems = {};
                 await serialize(() => handleSubscriptionAndEvents(node, msg));
                 return;
@@ -559,6 +595,7 @@ module.exports = function(RED) {
         });
         node.on("close", async (done) => {
             node.closing = true;
+            node.cancelRetry();
             node.monitoringRevision++;
             // NOTE: the endpoint may outlive this node (partial deploy), so the listeners must be removed
             node.endpoint.removeListener("CONNECTING", onConnecting);
